@@ -1,0 +1,165 @@
+{
+  "2": {
+    "inputs": {
+      "image": "example.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "3": {
+    "inputs": {
+      "bbox_threshold": 0.5,
+      "bbox_dilation": 0,
+      "crop_factor": 3,
+      "drop_size": 10,
+      "sub_threshold": 0.5,
+      "sub_dilation": 0,
+      "sub_bbox_expansion": 0,
+      "sam_mask_hint_threshold": 0.7,
+      "post_dilation": 0,
+      "bbox_detector": [
+        "4",
+        0
+      ],
+      "image": [
+        "2",
+        0
+      ],
+      "sam_model_opt": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "ImpactSimpleDetectorSEGS",
+    "_meta": {
+      "title": "Simple Detector (SEGS)"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model_name": "bbox/face_yolov8n_v2.pt"
+    },
+    "class_type": "UltralyticsDetectorProvider",
+    "_meta": {
+      "title": "UltralyticsDetectorProvider"
+    }
+  },
+  "5": {
+    "inputs": {
+      "model_name": "sam_vit_b_01ec64.pth",
+      "device_mode": "AUTO"
+    },
+    "class_type": "SAMLoader",
+    "_meta": {
+      "title": "SAMLoader (Impact)"
+    }
+  },
+  "6": {
+    "inputs": {
+      "ckpt_name": "NoobAI-XL-v1.1.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "6",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "6",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "9": {
+    "inputs": {
+      "images": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "11": {
+    "inputs": {
+      "steps": 8,
+      "cfg_scale": 3,
+      "sampler": "euler_ancestral",
+      "scheduler": "sgm_uniform",
+      "denoise_strength": 0.4,
+      "seed": 0,
+      "processing_resolution": 1024,
+      "enable_pre_upscale": true,
+      "upscaler_model": "4x_NMKD-Siax_200k.pth",
+      "crop_padding": 1.2,
+      "enable_mask_cleanup": true,
+      "face_positive_prompt": "face focus",
+      "face_negative_prompt": "",
+      "replace_positive_prompt": false,
+      "replace_negative_prompt": false,
+      "blend_softness": 8,
+      "mask_expansion": 0,
+      "sampling_mask_blur_size": 21,
+      "sampling_mask_blur_strength": 1,
+      "enable_vertical_flip": false,
+      "enable_color_correction": true,
+      "color_correction_strength": 1,
+      "face_selection": 0,
+      "image": [
+        "2",
+        0
+      ],
+      "model": [
+        "6",
+        0
+      ],
+      "vae": [
+        "6",
+        2
+      ],
+      "positive": [
+        "7",
+        0
+      ],
+      "negative": [
+        "8",
+        0
+      ],
+      "segs": [
+        "3",
+        0
+      ],
+      "clip": [
+        "6",
+        1
+      ]
+    },
+    "class_type": "ForbiddenVisionFaceProcessorIntegrated",
+    "_meta": {
+      "title": "Forbidden Vision - Face Processor"
+    }
+  }
+}

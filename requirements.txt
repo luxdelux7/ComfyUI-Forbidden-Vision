@@ -1,0 +1,5 @@
+segment-anything
+ultralytics
+opencv-python-headless
+numpy
+scikit-image

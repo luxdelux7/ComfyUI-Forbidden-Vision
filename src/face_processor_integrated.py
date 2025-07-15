@@ -3,17 +3,13 @@ import torch.nn.functional as F
 import numpy as np
 import random 
 import nodes
-from PIL import Image
 import folder_paths
 import comfy.model_management as model_management
 import comfy.utils
 import comfy.samplers
 import comfy.sample
-import comfy.sd
 import latent_preview
 import cv2
-import os
-from datetime import datetime
 from .face_detector import ForbiddenVisionFaceDetector
 from .mask_processor import ForbiddenVisionMaskProcessor
 from .utils import safe_tensor_to_numpy, safe_numpy_to_tensor, check_for_interruption, get_yolo_models, get_sam_models
@@ -59,6 +55,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 "sam_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Confidence threshold for the internal SAM mask refinement."}),
                 "bbox_model": (get_yolo_models(), {"tooltip": "Internal BBOX detector model (YOLO). Used if 'mask' is not connected."}),
                 "sam_model": (get_sam_models(), {"tooltip": "Internal Segment Anything Model (SAM). Used if 'mask' is not connected."}),
+                "attempt_face_completion": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Attempt to find and graft separated parts of the face (e.g., chin obscured by hair)."}),
             },
             "optional": {
                 "mask": ("MASK", {"tooltip": "Optional: Face mask for processing. If connected, internal detection is skipped."}),
@@ -101,20 +98,11 @@ class ForbiddenVisionFaceProcessorIntegrated:
     def __init__(self):
         self.face_detector = ForbiddenVisionFaceDetector()
         self.mask_processor = ForbiddenVisionMaskProcessor()
-        self.sampling_cache = {}
-        self.total_cache = {}
+        self.last_sampling_key = None
+        self.last_sampling_result = None
         self.upscaler_model = None
         self.upscaler_model_name = None
 
-    def clear_cache(self):
-        """Clear all cached data to ensure fresh processing"""
-        try:
-            if hasattr(self, 'total_cache'):
-                self.total_cache.clear()
-            print("Face processor cache cleared")
-        except Exception as e:
-            print(f"Error clearing cache: {e}")
-            
     def load_upscaler_model(self, model_name):
         if self.upscaler_model is not None and self.upscaler_model_name == model_name:
             return True
@@ -167,8 +155,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             return image_np_uint8
         except Exception as e:
             print(f"Error during upscaling process: {e}. Falling back to standard resize.")
-            import traceback
-            traceback.print_exc()
             return image_np_uint8
 
         upscaled_np = upscaled_tensor.squeeze(0).cpu().numpy()
@@ -177,10 +163,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
         return upscaled_np_uint8
     
     def combine_all_faces_to_final_image(self, original_image, all_processed_faces, all_restore_info, blend_softness, enable_color_correction=False, color_correction_strength=1.0):
-        """
-        Combines all processed faces onto the original image using a unified mask and an efficient,
-        performance-optimized color correction workflow.
-        """
         try:
             check_for_interruption()
             
@@ -193,7 +175,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             new_faces_canvas = original_np.copy()
             unified_compositing_mask = np.zeros((h, w), dtype=np.float32)
 
-            for i, (processed_face_tensor, restore_info) in enumerate(zip(all_processed_faces, all_restore_info)):
+            for processed_face_tensor, restore_info in zip(all_processed_faces, all_restore_info):
                 check_for_interruption()
                 
                 if isinstance(restore_info, list):
@@ -248,8 +230,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error combining faces to final image: {e}")
-            import traceback
-            traceback.print_exc()
             return original_image
     def process_face_complete(self, image, model, vae, positive, negative, 
                             steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
@@ -258,7 +238,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                             blend_softness, mask_expansion,
                             sampling_mask_blur_size, sampling_mask_blur_strength,
                             enable_vertical_flip, enable_color_correction, color_correction_strength,
-                            face_selection, detection_confidence, sam_threshold, bbox_model, sam_model,
+                            face_selection, detection_confidence, sam_threshold, bbox_model, sam_model, attempt_face_completion,
                             mask=None, clip=None):
         try:
             check_for_interruption()
@@ -270,65 +250,57 @@ class ForbiddenVisionFaceProcessorIntegrated:
             original_image = image
             face_masks = []
 
+
+            final_positive, final_negative = self.enhance_conditioning_with_face_prompts(
+                positive, negative, face_positive_prompt, face_negative_prompt, 
+                replace_positive_prompt, replace_negative_prompt, clip
+            )
+
             if mask is not None:
-                print("INFO: 'mask' input connected. Processing based on provided mask.")
                 face_masks = [mask]
             else:
-                print("INFO: No 'mask' input. Running internal face detection with two-stage approach.")
                 np_masks = self.face_detector.detect_faces(
                     image_tensor=image, 
                     bbox_model_name=bbox_model, 
                     sam_model_name=sam_model,
                     detection_confidence=detection_confidence, 
                     sam_threshold=sam_threshold, 
-                    face_selection=face_selection
+                    face_selection=face_selection,
+                    attempt_face_completion=attempt_face_completion
                 )
                 if np_masks:
                     face_masks = [torch.from_numpy(m).unsqueeze(0) for m in np_masks]
 
             if not face_masks:
-                print("ERROR: No face masks found from any source. Cannot proceed.")
+                print("ERROR: No face masks found. Cannot proceed.")
                 return self.create_safe_fallback_outputs(image, processing_resolution)
 
-            sampling_cache_key = self.get_sampling_cache_key_only(
-                image, mask, model, vae, positive, negative, steps, cfg_scale, sampler, scheduler, 
+            current_sampling_key = self.get_sampling_cache_key_only(
+                image, mask, model, vae, final_positive, final_negative,
+                steps, cfg_scale, sampler, scheduler, 
                 denoise_strength, seed, processing_resolution, enable_pre_upscale, upscaler_model, crop_padding, 
-                face_positive_prompt, face_negative_prompt, replace_positive_prompt, 
-                replace_negative_prompt, mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, 
-                enable_vertical_flip, face_selection, clip, detection_confidence, sam_threshold, bbox_model, sam_model
-            )
-            compositing_cache_key = self.get_compositing_cache_key(
-                sampling_cache_key, blend_softness, enable_color_correction, color_correction_strength
+                mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, 
+                enable_vertical_flip, face_selection, detection_confidence, sam_threshold, bbox_model, sam_model,
+                attempt_face_completion
             )
 
-            if hasattr(self, 'total_cache') and compositing_cache_key and compositing_cache_key in self.total_cache:
-                print("DEBUG: Using cached results for entire processing (L2 Cache Hit)")
-                return self.total_cache[compositing_cache_key]
-            
-            all_processed_faces, all_restore_info = [], []
-
-            if hasattr(self, 'sampling_cache') and sampling_cache_key and sampling_cache_key in self.sampling_cache:
-                print("DEBUG: Using cached sampling results (L1 Cache Hit). Re-compositing...")
-                all_processed_faces, all_restore_info = self.sampling_cache[sampling_cache_key]
+            if self.last_sampling_key == current_sampling_key and self.last_sampling_result is not None:
+                all_processed_faces, all_restore_info = self.last_sampling_result
             else:
-                print("DEBUG: Running fresh sampling for all faces (Cache Miss)")
                 
-                if enable_vertical_flip:
-                    image = torch.flip(image, dims=[1])
-                    if mask is not None:
-                        face_masks = [torch.flip(m, dims=[1]) for m in face_masks]
+                processing_image = torch.flip(image, dims=[1]) if enable_vertical_flip else image.clone()
+                if enable_vertical_flip and mask is not None:
+                    face_masks = [torch.flip(m, dims=[1]) for m in face_masks]
                 
-                original_base_image = image.clone()
-
+                all_processed_faces, all_restore_info = [], []
+                
                 for i, face_mask in enumerate(face_masks):
                     check_for_interruption()
-                    print(f"DEBUG: Processing face {i+1}/{len(face_masks)}")
                     processed_result = self.process_single_face_unified(
-                        original_base_image, face_mask, model, vae, positive, negative,
+                        processing_image, face_mask, model, vae, final_positive, final_negative,
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed + i,
                         processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
-                        face_positive_prompt, face_negative_prompt, replace_positive_prompt, replace_negative_prompt,
-                        mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, clip
+                        mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength
                     )
                     if processed_result:
                         _, processed_face, restore_info = processed_result
@@ -337,16 +309,21 @@ class ForbiddenVisionFaceProcessorIntegrated:
                         if len(face_masks) > 1 and i < len(face_masks) - 1 and torch.cuda.is_available():
                             torch.cuda.empty_cache()
                 
-                if sampling_cache_key:
-                    if not hasattr(self, 'sampling_cache'): self.sampling_cache = {}
-                    self.sampling_cache[sampling_cache_key] = (all_processed_faces, all_restore_info)
+                self.last_sampling_key = current_sampling_key
+                self.last_sampling_result = (all_processed_faces, all_restore_info)
 
             if not all_processed_faces:
-                 print("ERROR: All face processing failed. Returning original image.")
-                 return self.create_safe_fallback_outputs(original_image, processing_resolution)
+                print("ERROR: All face processing failed. Returning original image.")
+                return self.create_safe_fallback_outputs(original_image, processing_resolution)
+
 
             compositing_base_image = torch.flip(image, dims=[1]) if enable_vertical_flip else original_image.clone()
-            final_image = self.combine_all_faces_to_final_image(compositing_base_image, all_processed_faces, all_restore_info, blend_softness, enable_color_correction, color_correction_strength)
+            final_image = self.combine_all_faces_to_final_image(
+                compositing_base_image, all_processed_faces, all_restore_info, 
+                blend_softness, enable_color_correction, color_correction_strength
+            )
+            
+
             processed_face_output = self.create_combined_face_output(all_processed_faces, processing_resolution)
             side_by_side = self.create_unified_comparison(original_image, all_processed_faces, all_restore_info, processing_resolution)
             final_mask = self.create_unified_mask(all_restore_info, original_image)
@@ -356,21 +333,13 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 side_by_side = torch.flip(side_by_side, dims=[1])
                 final_mask = torch.flip(final_mask, dims=[1])
 
-            final_results = (final_image, processed_face_output, side_by_side, final_mask)
-
-            if compositing_cache_key:
-                if not hasattr(self, 'total_cache'): self.total_cache = {}
-                self.total_cache[compositing_cache_key] = final_results
-            
-            return final_results
+            return (final_image, processed_face_output, side_by_side, final_mask)
             
         except model_management.InterruptProcessingException:
             print("Face processing cancelled by user.")
             raise
         except Exception as e:
             print(f"An error occurred during the main face processing workflow: {e}")
-            import traceback
-            traceback.print_exc()
             (fallback_image, fallback_processed, fallback_comparison, fallback_mask) = self.create_safe_fallback_outputs(original_image, processing_resolution)
             if enable_vertical_flip:
                 fallback_image = torch.flip(fallback_image, dims=[1])
@@ -379,13 +348,52 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 fallback_mask = torch.flip(fallback_mask, dims=[1])
             return (fallback_image, fallback_processed, fallback_comparison, fallback_mask)
     
-    def get_sampling_cache_key_only(self, image, mask, model, vae, positive, negative,
+    def _hash_conditioning(self, conditioning):
+        try:
+            if not conditioning:
+                return 0
+            
+            final_hash = 0
+            for cond_item in conditioning:
+                tensor_hash = 0
+                if len(cond_item) > 0 and torch.is_tensor(cond_item[0]):
+                    tensor = cond_item[0]
+                    sample = tensor.flatten()[::max(1, tensor.numel() // 50)][:100]
+                    tensor_hash = hash(sample.cpu().numpy().round(4).tobytes())
+
+                dict_hash = 0
+                if len(cond_item) > 1 and isinstance(cond_item[1], dict):
+                    for key, value in sorted(cond_item[1].items()):
+                        key_hash = hash(key)
+                        value_hash = 0
+                        if torch.is_tensor(value):
+                            sample = value.flatten()[::max(1, value.numel() // 20)][:50]
+                            value_hash = hash(sample.cpu().numpy().round(4).tobytes())
+                        else:
+                            try:
+                                value_hash = hash(value)
+                            except TypeError:
+                                value_hash = hash(str(value))
+                        
+                        dict_hash = (dict_hash * 31) + hash((key_hash, value_hash))
+
+                item_hash = hash((tensor_hash, dict_hash))
+                final_hash = (final_hash * 31) + item_hash
+                
+            return final_hash
+            
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            print(f"Warning: Could not fully hash conditioning, caching might be less reliable. Error: {e}")
+            return random.randint(0, 0xffffffffffffffff)
+
+    def get_sampling_cache_key_only(self, image, mask, model, vae, final_positive, final_negative,
                                 steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
                                 processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
-                                face_positive_prompt, face_negative_prompt, replace_positive_prompt, replace_negative_prompt,
                                 mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength,
-                                enable_vertical_flip, face_selection, clip,
-                                detection_confidence, sam_threshold, bbox_model, sam_model):
+                                enable_vertical_flip, face_selection,
+                                detection_confidence, sam_threshold, bbox_model, sam_model, attempt_face_completion):
         try:
             image_sample = image[0, ::96, ::96, :].flatten()[:50] if image.numel() > 2500 else image.flatten()[:50]
             image_hash = hash(tuple(image_sample.cpu().numpy().round(3)))
@@ -400,51 +408,28 @@ class ForbiddenVisionFaceProcessorIntegrated:
             model_hash = id(model)
             vae_hash = id(vae)
             
-            pos_hash = 0
-            if positive and len(positive) > 0 and len(positive[0]) > 0:
-                pos_sample = positive[0][0].flatten()[:20].cpu().numpy() if positive[0][0].numel() > 20 else positive[0][0].flatten().cpu().numpy()
-                pos_hash = hash(tuple(pos_sample.round(3)))
-            
-            neg_hash = 0
-            if negative and len(negative) > 0 and len(negative[0]) > 0:
-                neg_sample = negative[0][0].flatten()[:20].cpu().numpy() if negative[0][0].numel() > 20 else negative[0][0].flatten().cpu().numpy()
-                neg_hash = hash(tuple(neg_sample.round(3)))
-            
-            face_pos_hash = hash(face_positive_prompt[:100]) if face_positive_prompt else 0
-            face_neg_hash = hash(face_negative_prompt[:100]) if face_negative_prompt else 0
-            clip_hash = id(clip) if clip else 0
+            pos_hash = self._hash_conditioning(final_positive)
+            neg_hash = self._hash_conditioning(final_negative)
             
             return (
                 image_hash, mask_hash, tuple(image.shape),
                 model_hash, vae_hash, pos_hash, neg_hash,
                 steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
                 processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
-                face_pos_hash, face_neg_hash, replace_positive_prompt, replace_negative_prompt,
                 mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength,
-                enable_vertical_flip, face_selection, clip_hash
+                enable_vertical_flip, face_selection, attempt_face_completion
             )
             
+        except model_management.InterruptProcessingException:
+            raise
         except Exception as e:
             print(f"Error generating sampling cache key: {e}")
             return None
-
-    def get_compositing_cache_key(self, sampling_cache_key, blend_softness, enable_color_correction, color_correction_strength):
-        """Cache key for final compositing (includes compositing-only parameters)"""
-        try:
-            return (
-                sampling_cache_key,
-                blend_softness, enable_color_correction, color_correction_strength
-            )
-        except Exception as e:
-            print(f"Error generating compositing cache key: {e}")
-            return None
     
-    def process_single_face_unified(self, image, mask, model, vae, positive, negative,
+    def process_single_face_unified(self, image, mask, model, vae, final_positive, final_negative,
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
                         processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
-                        face_positive_prompt, face_negative_prompt, replace_positive_prompt, replace_negative_prompt,
-                        mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, clip):
-        """Unified method to process a single face"""
+                        mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength):
         try:
             if mask is None:
                 return None
@@ -464,13 +449,8 @@ class ForbiddenVisionFaceProcessorIntegrated:
             if self.is_empty_detection(cropped_face, restore_info):
                 return None
             
-            enhanced_positive, enhanced_negative = self.enhance_conditioning_with_face_prompts(
-                positive, negative, face_positive_prompt, face_negative_prompt, 
-                replace_positive_prompt, replace_negative_prompt, clip
-            )
-            
             processed_latent = self.run_inpaint_sampling(
-                cropped_face, sampler_mask_batch, model, vae, enhanced_positive, enhanced_negative,
+                cropped_face, sampler_mask_batch, model, vae, final_positive, final_negative,
                 steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
                 sampling_mask_blur_size, sampling_mask_blur_strength
             )
@@ -488,12 +468,9 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error processing single face: {e}")
-            import traceback
-            traceback.print_exc()
             return None
 
     def create_combined_face_output(self, processed_faces, processing_resolution):
-        """Create combined output from multiple processed faces"""
         try:
             if not processed_faces:
                 return torch.zeros((1, processing_resolution, processing_resolution, 3))
@@ -528,7 +505,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             return processed_faces[0] if processed_faces else torch.zeros((1, processing_resolution, processing_resolution, 3))
 
     def create_unified_comparison(self, original_image, processed_faces, restore_info_list, processing_resolution):
-        """Create unified side-by-side comparison"""
         try:
             if not processed_faces or not restore_info_list:
                 return original_image
@@ -536,7 +512,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             original_np = self.fast_tensor_to_numpy(original_image, target_range=(0, 255))
             comparisons = []
             
-            for i, (processed_face, restore_info) in enumerate(zip(processed_faces, restore_info_list)):
+            for processed_face, restore_info in zip(processed_faces, restore_info_list):
                 crop_coords = restore_info["crop_coords"]
                 crop_x1, crop_y1, crop_x2, crop_y2 = crop_coords
                 
@@ -569,30 +545,23 @@ class ForbiddenVisionFaceProcessorIntegrated:
             return original_image
 
     def create_unified_mask(self, restore_info_list, image):
-        """Create and polish a unified mask from all processed faces."""
         try:
             if not restore_info_list:
                 image_shape = image.shape
                 return torch.zeros((1, image_shape[1], image_shape[2]), dtype=torch.float32)
             
-            print(f"DEBUG: Creating unified mask from {len(restore_info_list)} faces")
             
             image_shape = image.shape
             original_height, original_width = image_shape[1], image_shape[2]
             combined_mask = np.zeros((original_height, original_width), dtype=np.float32)
             
-            for i, restore_info in enumerate(restore_info_list):
+            for restore_info in restore_info_list:
                 blend_mask = restore_info.get("blend_mask")
                 if blend_mask is not None:
-                    print(f"DEBUG: Adding blend_mask from face {i} (shape: {blend_mask.shape})")
                     combined_mask = np.maximum(combined_mask, blend_mask)
-                else:
-                    print(f"DEBUG: Face {i} has no blend_mask")
 
-            # Unconditionally polish the final combined mask for the best possible output
             polished_mask = self.mask_processor.polish_mask(combined_mask)
             
-            print(f"DEBUG: Final polished mask has {np.sum(polished_mask > 0)} non-zero pixels")
             return torch.from_numpy(polished_mask).unsqueeze(0)
             
         except model_management.InterruptProcessingException:
@@ -633,7 +602,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
     
 
     def create_safe_fallback_outputs(self, image, processing_resolution):
-        """Create safe fallback outputs that match expected formats"""
         try:
             final_output = image.clone() if image is not None else torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             
@@ -668,8 +636,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 return positive, negative
             
             if clip is None:
-                print("Face prompts provided but no CLIP model connected - ignoring face prompts")
-                print("Connect a CLIP model to use face_positive_prompt and face_negative_prompt")
                 return positive, negative
             
             enhanced_positive = self.modify_conditioning_with_prompt(
@@ -686,7 +652,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error enhancing conditioning with face prompts: {e}")
-            print("Falling back to original conditioning")
             return positive, negative
 
     def modify_conditioning_with_prompt(self, conditioning, face_prompt, prompt_type, clip, overwrite_mode):
@@ -698,12 +663,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             new_cond, new_pooled = clip.encode_from_tokens(tokens, return_pooled=True)
 
             if overwrite_mode:
-                enhanced_conditioning = []
-                for original_item in conditioning:
-                    new_opts = original_item[1].copy()
-                    new_opts["pooled_output"] = new_pooled
-                    enhanced_conditioning.append([new_cond, new_opts])
-                return enhanced_conditioning
+                return [[new_cond, {"pooled_output": new_pooled}]]
             else:
                 if not conditioning:
                     return [[new_cond, {"pooled_output": new_pooled}]]
@@ -718,8 +678,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error modifying {prompt_type} conditioning: {e}")
-            import traceback
-            traceback.print_exc()
             return conditioning
 
     def tensor_to_numpy_comparison(self, tensor):
@@ -729,10 +687,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
         return self.fast_numpy_to_tensor(np_array, input_range=(0, 255))
     
     def _perform_color_correction(self, processed_face_np, original_crop_np, correction_strength):
-        """
-        An efficient helper that performs color correction on NumPy arrays.
-        It expects the processed face and the corresponding crop from the original image.
-        """
         try:
             original_face_resized = cv2.resize(original_crop_np,
                                             (processed_face_np.shape[1], processed_face_np.shape[0]),
@@ -810,8 +764,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error in inpaint sampling: {e}")
-            import traceback
-            traceback.print_exc()
             return {"samples": torch.zeros((1, 4, 64, 64), dtype=torch.float32)}
   
     def process_inpaint_mask(self, face_mask, latent_height, latent_width, device, blur_size, blur_strength):
@@ -928,8 +880,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error in KSampler: {e}")
-            import traceback
-            traceback.print_exc()
             latent_shape = latent.get("samples", torch.zeros((1, 4, 64, 64))).shape
             return {"samples": torch.zeros(latent_shape, device=model_management.get_torch_device())}
 
@@ -962,80 +912,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
         except Exception as e:
             print(f"Error preparing conditioning: {e}")
             return conditioning
-
-    def restore_faces_unified(self, processed_face_batch, restore_info, blend_softness):
-        try:
-            if isinstance(restore_info, list):
-                restore_info = restore_info[0]
-            
-            original_image_np = restore_info["original_image"].squeeze(0)
-            if original_image_np.max() <= 1.0:
-                final_result_np = original_image_np.copy()
-            else:
-                final_result_np = original_image_np.astype(np.float32) / 255.0
-            
-            processed_float = processed_face_batch.squeeze(0).cpu().numpy()
-            
-            crop_coords = restore_info["crop_coords"]
-            crop_x1, crop_y1, crop_x2, crop_y2 = crop_coords
-            
-            actual_crop_w, actual_crop_h = crop_x2 - crop_x1, crop_y2 - crop_y1
-            
-            if actual_crop_w <= 0 or actual_crop_h <= 0:
-                print(f"Skipping restoration due to invalid crop dimensions: {actual_crop_w}x{actual_crop_h}")
-                return torch.from_numpy(restore_info["original_image"])
-
-            resized_processed_face = self.high_quality_resize(
-                processed_float, (actual_crop_w, actual_crop_h)
-            )
-            
-            original_crop = final_result_np[crop_y1:crop_y2, crop_x1:crop_x2]
-            
-            full_blend_mask = restore_info.get("blend_mask")
-            if full_blend_mask is None: 
-                print(f"Warning: No blend_mask found, using fallback")
-                paste_mask = np.ones((actual_crop_h, actual_crop_w), dtype=np.float32)
-            else:
-                paste_mask = full_blend_mask[crop_y1:crop_y2, crop_x1:crop_x2]
-                if paste_mask.shape != (actual_crop_h, actual_crop_w):
-                    paste_mask = self.high_quality_resize_mask(paste_mask, (actual_crop_w, actual_crop_h))
-            
-            compositing_mask = self.create_compositing_blend_mask(paste_mask, blend_softness)
-            restore_info["compositing_mask_used"] = compositing_mask
-            compositing_mask = np.clip(compositing_mask, 0.0, 1.0)
-            compositing_mask_3d = np.stack([compositing_mask] * 3, axis=-1)
-            
-            pasted_crop = resized_processed_face * compositing_mask_3d + original_crop * (1.0 - compositing_mask_3d)
-            
-            final_result_np[crop_y1:crop_y2, crop_x1:crop_x2] = pasted_crop
-            
-            final_tensor = torch.from_numpy(np.clip(final_result_np, 0.0, 1.0)).unsqueeze(0)
-            
-            return final_tensor
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in unified restoration: {e}")
-            import traceback
-            traceback.print_exc()
-            return torch.from_numpy(restore_info["original_image"])
-
-    def _unsharp_mask(self, image, amount=0.5, sigma=0.8, threshold=0.02):
-        try:
-            if image.size == 0: return image
-            blurred = cv2.GaussianBlur(image, (0, 0), sigma)
-            detail_mask = image - blurred
-            if threshold > 0:
-                contrast_mask = np.abs(detail_mask) >= threshold
-                detail_mask = np.where(contrast_mask, detail_mask, 0)
-            sharpened = image + detail_mask * amount
-            return np.clip(sharpened, 0.0, 1.0)
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in unsharp mask: {e}")
-            return image
 
     def high_quality_resize(self, image_float, target_size):
         try:
@@ -1073,36 +949,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error in high quality resize: {e}")
             return cv2.resize(image_float, target_size, interpolation=cv2.INTER_AREA)
 
-    def high_quality_resize_mask(self, mask, target_size):
-        try:
-            target_w, target_h = target_size
-            current_h, current_w = mask.shape[:2]
-            scale_factor = min(target_w / current_w, target_h / current_h)
-            
-            interpolation = cv2.INTER_LANCZOS4 if scale_factor > 1.0 else cv2.INTER_LINEAR
-            if mask.dtype != np.float32: mask = mask.astype(np.float32)
-            resized_mask = cv2.resize(mask, (target_w, target_h), interpolation=interpolation)
-            if scale_factor != 1.0: resized_mask = self.sharpen_mask_edges(resized_mask)
-            return np.clip(resized_mask, 0.0, 1.0)
-        except Exception as e:
-            print(f"Error in mask resize: {e}")
-            return cv2.resize(mask, target_size, interpolation=cv2.INTER_LINEAR)
-
-    def sharpen_mask_edges(self, mask, strength=0.3):
-        try:
-            kernel = np.array([[-1, -1, -1], [-1,  9, -1], [-1, -1, -1]]) * strength
-            kernel[1,1] = 1 + strength * 8
-            sharpened = cv2.filter2D(mask, -1, kernel)
-            return np.clip(sharpened, 0.0, 1.0)
-        except Exception as e:
-            print(f"Error in mask sharpening: {e}")
-            return mask
-
     def create_compositing_blend_mask(self, clean_sam_mask, blend_softness):
-        """
-        Creates a superior hybrid compositing mask. It preserves the core details of the
-        new generation while also expanding the blend outward for seamless, full coverage.
-        """
         try:
             if blend_softness <= 0:
                 return (clean_sam_mask > 0.5).astype(np.float32)
@@ -1144,8 +991,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error creating hybrid blend mask: {e}")
-            import traceback
-            traceback.print_exc()
             return (clean_sam_mask > 0.5).astype(np.float32)
         
     def fast_tensor_to_numpy(self, tensor, target_range=(0, 255)):

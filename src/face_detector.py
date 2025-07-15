@@ -1,13 +1,10 @@
 import torch
 import numpy as np
 import cv2
-import os
-import folder_paths
 import comfy.model_management as model_management
 from .utils import check_for_interruption, find_model_path
-import time
 from skimage.morphology import remove_small_objects, remove_small_holes, closing, disk
-from PIL import Image, ImageDraw
+from PIL import Image
 
 class ForbiddenVisionFaceDetector:
     def __init__(self):
@@ -63,62 +60,6 @@ class ForbiddenVisionFaceDetector:
             return mask_pixel_area / hull_area
         except Exception: return 0.5
 
-    def calculate_vertical_centering_score(self, mask_np, tight_bbox):
-        try:
-            if mask_np.sum() == 0: return 0.0
-            coords = np.argwhere(mask_np > 0.5)
-            if coords.shape[0] == 0: return 0.0
-            mask_center_y = coords[:, 0].mean()
-            
-            tight_y1, tight_y2 = tight_bbox[1], tight_bbox[3]
-            bbox_center_y = (tight_y1 + tight_y2) / 2.0
-            
-            bbox_height = tight_y2 - tight_y1
-            if bbox_height == 0: return 0.5
-            
-            offset = (bbox_center_y - mask_center_y) / bbox_height
-            
-            return max(0.0, 1.0 - abs(offset) * 2.0)
-        except Exception:
-            return 0.0
-        
-    def calculate_boundary_fit_score(self, mask_np, tight_bbox):
-        try:
-            if mask_np.sum() == 0: return 1.0
-            total_pixels = np.sum(mask_np > 0.5)
-            if total_pixels == 0: return 1.0
-            x1, y1, x2, y2 = tight_bbox
-            h, w = mask_np.shape
-            bbox_mask = np.zeros((h, w), dtype=np.uint8)
-            bbox_mask[y1:y2, x1:x2] = 1
-            inside_pixels = np.sum((mask_np > 0.5) & (bbox_mask > 0))
-            return inside_pixels / total_pixels
-        except Exception: return 0.0
-    def calculate_edge_protrusion_score(self, mask_np, tight_bbox):
-        try:
-            if mask_np.sum() == 0: return 1.0
-            x1, y1, x2, y2 = tight_bbox
-            h, w = mask_np.shape
-            
-            edge_thickness_x = max(1, int((x2 - x1) * 0.05))
-            edge_thickness_y = max(1, int((y2 - y1) * 0.05))
-            
-            left_edge = np.sum(mask_np[y1:y2, x1:x1+edge_thickness_x] > 0.5)
-            right_edge = np.sum(mask_np[y1:y2, x2-edge_thickness_x:x2] > 0.5)
-            top_edge = np.sum(mask_np[y1:y1+edge_thickness_y, x1:x2] > 0.5)
-            bottom_edge = np.sum(mask_np[y2-edge_thickness_y:y2, x1:x2] > 0.5)
-            
-            total_edge_pixels = left_edge + right_edge + top_edge + bottom_edge
-            max_left_right = edge_thickness_x * (y2 - y1) * 2
-            max_top_bottom = edge_thickness_y * (x2 - x1) * 2
-            max_edge_pixels = max_left_right + max_top_bottom
-            
-            if max_edge_pixels == 0: return 1.0
-            
-            edge_fill_ratio = total_edge_pixels / max_edge_pixels
-            return max(0.0, 1.0 - edge_fill_ratio)
-        except Exception: 
-            return 0.5
     def calculate_face_coverage_ratio(self, mask_np, tight_bbox):
         try:
             if mask_np.sum() == 0: return 0.0
@@ -137,61 +78,15 @@ class ForbiddenVisionFaceDetector:
                 return 0.9 + 0.1 * (1.0 - abs(coverage_ratio - 0.7) / 0.3)
         except Exception:
             return 0.5
-    def cleanup_mask_intelligent(self, mask_np, area_ratio_threshold=0.05):
-        try:
-            if mask_np.sum() == 0: return mask_np
-            mask_uint8 = (mask_np > 0.5).astype(np.uint8)
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_uint8, 4, cv2.CV_32S)
-            if num_labels <= 2: return mask_np
-            
-            areas = stats[1:, cv2.CC_STAT_AREA]
-            max_area_idx = areas.argmax() + 1
-            max_area = areas[max_area_idx - 1]
-            
-            cleaned_mask = np.zeros_like(mask_uint8)
-            cleaned_mask[labels == max_area_idx] = 1
-            
-            for i in range(1, num_labels):
-                if i == max_area_idx: continue
-                
-                component_area = stats[i, cv2.CC_STAT_AREA]
-                if component_area >= max_area * area_ratio_threshold:
-                    component_mask = (labels == i)
-                    dilated_main = cv2.dilate(cleaned_mask.astype(np.uint8), 
-                                            np.ones((20, 20), np.uint8), iterations=1)
-                    
-                    if np.any(component_mask & dilated_main):
-                        cleaned_mask[labels == i] = 1
-                        
-            return cleaned_mask.astype(np.float32)
-        except Exception: return mask_np
 
     def make_crop_region(self, bbox, w, h, crop_factor=2.0):
         x1, y1, x2, y2 = bbox
         bw, bh = x2 - x1, y2 - y1
         ew, eh = int(bw * (crop_factor-1.0)/2.0), int(bh * (crop_factor-1.0)/2.0)
         return [max(0, x1 - ew), max(0, y1 - eh), min(w, x2 + ew), min(h, y2 + eh)]
-    def light_cleanup_for_scoring(self, mask_np, min_area=50):
-        """Light cleanup just for scoring - remove tiny fragments."""
-        try:
-            if mask_np.sum() == 0: return mask_np
-            
-            mask_uint8 = (mask_np > 0.5).astype(np.uint8)
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_uint8, 4, cv2.CV_32S)
-            
-            if num_labels <= 1: return mask_np
-            
-            cleaned_mask = np.zeros_like(mask_uint8)
-            for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] >= min_area:
-                    cleaned_mask[labels == i] = 1
-                    
-            return cleaned_mask.astype(np.float32)
-        except Exception:
-            return mask_np
+
     def select_best_mask(self, all_masks_data, tight_bbox):
 
-        print("--- Selecting Best Face Mask (Iterative Sanity Check Strategy) ---")
         if not all_masks_data:
             return None
 
@@ -200,7 +95,6 @@ class ForbiddenVisionFaceDetector:
         bbox_width = x2 - x1
         bbox_height = y2 - y1
 
-        print("  Phase 1: Scoring all candidates with balanced profile...")
         scored_candidates = []
         for data in all_masks_data:
             mask = data['original_mask']
@@ -217,9 +111,6 @@ class ForbiddenVisionFaceDetector:
             if y2 < h: outside_bbox_area += np.sum(mask[y2:h, :] > 0.5)
             if x1 > 0: outside_bbox_area += np.sum(mask[max(0,y1):min(h,y2), 0:x1] > 0.5)
             if x2 < w: outside_bbox_area += np.sum(mask[max(0,y1):min(h,y2), x2:w] > 0.5)
-            
-            containment_ratio = inside_bbox_area / total_mask_area if total_mask_area > 0 else 0
-            coverage_ratio = inside_bbox_area / bbox_area if bbox_area > 0 else 0
             
             outside_ratio = outside_bbox_area / total_mask_area if total_mask_area > 0 else 0
             
@@ -266,24 +157,13 @@ class ForbiddenVisionFaceDetector:
             data['final_score'] = final_score
             scored_candidates.append(data)
             
-            print(f"  Mask {data['index']} cleanliness: {num_labels-1} components (post-gentle-clean), {edge_noise_ratio*100:.1f}% edge noise -> score {cleanliness_score:.2f}")
-            perfect_containment_bonus = 0.04 if outside_bbox_area == 0 else 0
-            clean_edges_bonus = 0.02 if edge_noise_ratio < 0.01 else 0
-            sam_bonus = data.get('sam_score', 0) * 0.01
-            total_bonus = perfect_containment_bonus + clean_edges_bonus + sam_bonus
-            print(f"  Mask {data['index']}: Final Score={final_score:.3f} | "
-                    f"Containment={containment_ratio:.2f} ({containment_score:.2f}), "
-                    f"Coverage={coverage_ratio:.2f} ({coverage_score:.2f}), "
-                    f"Clean={cleanliness_score:.2f}, Shape={shape_score:.2f}, "
-                    f"Bonus={total_bonus:.3f}")
 
         if not scored_candidates:
-            print("ERROR: No candidates could be scored. Cannot select a mask.")
+
             return None
 
         sorted_candidates = sorted(scored_candidates, key=lambda x: x['final_score'], reverse=True)
         
-        print("\n  Phase 2: Performing iterative sanity check on sorted candidates...")
         core_x1 = x1 + int(bbox_width * 0.25)
         core_y1 = y1 + int(bbox_height * 0.25)
         core_x2 = x2 - int(bbox_width * 0.25)
@@ -292,27 +172,20 @@ class ForbiddenVisionFaceDetector:
         CORE_FILL_THRESHOLD = 0.3
         
         best_mask_data = None
-        for i, candidate in enumerate(sorted_candidates):
+        for candidate in sorted_candidates:
             if core_area > 0:
                 core_fill = np.sum(candidate['original_mask'][core_y1:core_y2, core_x1:core_x2] > 0.5)
                 core_fill_ratio = core_fill / core_area
             else:
                 core_fill_ratio = 0.0
-            
-            print(f"    - Checking candidate at rank {i+1} (Mask #{candidate['index']}): Core fill ratio = {core_fill_ratio:.2f}")
-            
+       
             if core_fill_ratio >= CORE_FILL_THRESHOLD:
-                print(f"      -> Sanity check PASSED. Selecting this mask.")
                 best_mask_data = candidate
                 break
-            else:
-                print(f"      -> Sanity check FAILED. Mask is likely hollow. Checking next candidate.")
-        
+
         if best_mask_data is None:
-            print("  Warning: No candidate passed the sanity check. Falling back to the highest-scored conventional mask.")
             best_mask_data = sorted_candidates[0]
             
-        print(f"--- Selected Mask #{best_mask_data['index']} with score {best_mask_data['final_score']:.3f} ---")
         
         best_base = best_mask_data
         best_base['complementary_masks'] = [
@@ -321,95 +194,7 @@ class ForbiddenVisionFaceDetector:
         ]
         
         return best_base
-    def identify_facial_holes(self, mask_np, mask_geometry, zones):
-        try:
-            if mask_np.sum() == 0 or mask_geometry is None or zones is None:
-                return []
-                
-            mask_uint8 = (mask_np > 0.5).astype(np.uint8)
-            safe_boundary = zones['safe_fill_boundary']
-            
-            inverted_mask = cv2.bitwise_not(mask_uint8 * 255)
-            
-            h, w = inverted_mask.shape[:2]
-            if h <= 2 or w <= 2:
-                return []
-                
-            mask_for_flooding = inverted_mask.copy()
-            mask_flood = np.zeros((h + 2, w + 2), np.uint8)
-            cv2.floodFill(mask_for_flooding, mask_flood, (0, 0), 0)
-            
-            holes_mask = mask_for_flooding.astype(np.uint8)
-            
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(holes_mask, 4, cv2.CV_32S)
-            
-            legitimate_holes = []
-            mask_area = mask_geometry['area']
-            centroid_x, centroid_y = zones['centroid']
-            
-            print(f"  Found {num_labels-1} potential holes in mask-based analysis")
-            
-            for i in range(1, num_labels):
-                hole_area = stats[i, cv2.CC_STAT_AREA]
-                cx, cy = centroids[i]
-                
-                if hole_area < 5:
-                    continue
-                    
-                if safe_boundary[int(cy), int(cx)] == 0:
-                    print(f"    Hole {i}: outside safe boundary at ({cx:.1f}, {cy:.1f}) - rejected")
-                    continue
-                
-                distance_from_center = np.sqrt((cx - centroid_x)**2 + (cy - centroid_y)**2)
-                max_distance = min(mask_geometry['width'], mask_geometry['height']) * 0.4
-                
-                if distance_from_center > max_distance:
-                    print(f"    Hole {i}: too far from face center ({distance_from_center:.1f} > {max_distance:.1f}) - rejected")
-                    continue
-                
-                relative_hole_size = hole_area / mask_area if mask_area > 0 else 0
-                if relative_hole_size > 0.15:
-                    print(f"    Hole {i}: too large ({relative_hole_size:.3f} of mask area) - rejected")
-                    continue
-                
-                hole_w = stats[i, cv2.CC_STAT_WIDTH]
-                hole_h = stats[i, cv2.CC_STAT_HEIGHT]
-                aspect_ratio = hole_w / hole_h if hole_h > 0 else 1
-                
-                if not (0.1 < aspect_ratio < 10.0):
-                    print(f"    Hole {i}: bad aspect ratio ({aspect_ratio:.2f}) - rejected")
-                    continue
-                
-                hole_type = 'unknown'
-                if zones['eye_zone'][int(cy), int(cx)] == 1:
-                    hole_type = 'eye'
-                elif zones['nose_zone'][int(cy), int(cx)] == 1:
-                    hole_type = 'nose'
-                elif zones['mouth_zone'][int(cy), int(cx)] == 1:
-                    hole_type = 'mouth'
-                else:
-                    print(f"    Hole {i}: not in recognized facial zone - rejected")
-                    continue
-                
-                legitimate_holes.append({
-                    'label': i,
-                    'area': hole_area,
-                    'centroid': (cx, cy),
-                    'type': hole_type,
-                    'aspect_ratio': aspect_ratio,
-                    'relative_size': relative_hole_size,
-                    'distance_from_center': distance_from_center
-                })
-                print(f"      -> Accepted as {hole_type} (area: {hole_area} pixels, distance: {distance_from_center:.1f})")
-            
-            print(f"  Identified {len(legitimate_holes)} facial holes: {[h['type'] for h in legitimate_holes]}")
-            return legitimate_holes
-            
-        except Exception as e:
-            print(f"Error identifying facial holes: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+    
     def generate_sam_masks(self, bbox):
         all_masks, all_scores = [], []
         
@@ -423,90 +208,105 @@ class ForbiddenVisionFaceDetector:
         masks_box, scores_box, _ = self.sam_predictor.predict(box=np.array(bbox), multimask_output=True)
         if masks_box is not None: all_masks.extend(masks_box); all_scores.extend(scores_box)
         
-        print(f"  Generated a pool of {len(all_masks)} masks from dual-prompt strategy.")
-        for i, (m, s) in enumerate(zip(all_masks, all_scores)):
-            self.debug_save_sam_mask(m, f"RAW_CANDIDATE_Idx{i}_Score{s:.3f}", bbox, s)
         return all_masks, all_scores
     
-    def refine_mask_by_grafting(self, best_mask_data, tight_bbox):
+    def _graft_satellite_masks(self, best_mask_data, all_masks_data, crop_bbox):
         try:
-            if not best_mask_data or 'mask' not in best_mask_data:
-                return np.zeros((100, 100), dtype=np.float32)
-
-            base_mask = (best_mask_data['mask'] > 0.5).astype(np.uint8)
-            h, w = base_mask.shape
+            check_for_interruption()
             
-            print(f"--- Refining mask #{best_mask_data['index']} with corrected hybrid refinement ---")
+            anchor_mask = (best_mask_data['original_mask'] > 0.5)
+            if np.sum(anchor_mask) == 0:
+                return best_mask_data.get('mask', np.zeros_like(anchor_mask, dtype=np.uint8))
 
-            mask_geometry = self.analyze_mask_geometry(base_mask.astype(np.float32))
-            if mask_geometry is None:
-                print("  Could not analyze mask geometry, returning original mask")
-                return base_mask.astype(np.float32)
-
-            mask_width = mask_geometry['width']
-            mask_height = mask_geometry['height']
-
-            prelim_kernel_size = max(5, int(min(mask_width, mask_height) * 0.05))
-            if prelim_kernel_size % 2 == 0: prelim_kernel_size += 1
+     
             
-            prelim_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (prelim_kernel_size, prelim_kernel_size))
-            smoothed_mask = cv2.morphologyEx(base_mask, cv2.MORPH_CLOSE, prelim_kernel)
+            vetted_candidates = []
+   
+            for c in all_masks_data:
+                if c['index'] == best_mask_data['index']:
+                    continue
+                
+                overall_solidity = self.calculate_solidity_score(c['original_mask'])
+                if overall_solidity > 0.70:
+                    vetted_candidates.append(c)
+                    
+
+            if not vetted_candidates:
+                return anchor_mask.astype(np.uint8)
+
+            anchor_inv = (anchor_mask == 0).astype(np.uint8)
+            dist_map   = cv2.distanceTransform(anchor_inv, cv2.DIST_L2, 5)
+
+            anchor_area = np.sum(anchor_mask)
+            equivalent_diameter = 2 * np.sqrt(anchor_area / np.pi)
             
-            pixels_added_smoothing = int(np.sum(smoothed_mask)) - int(np.sum(base_mask))
-            print(f"  Step 1 (Smoothing): Added {pixels_added_smoothing} pixels with kernel size {prelim_kernel_size}.")
+            min_area = 50 + (anchor_area * 0.0025)
+            min_dist_threshold = 3.0 + (equivalent_diameter * 0.015)
+            max_dist_threshold = equivalent_diameter * 0.30
+            max_area = anchor_area * 0.50
+
+
+            potential_grafts = []
+
+            for candidate in vetted_candidates:
+                check_for_interruption()
+
+                candidate_mask = (candidate['original_mask'] > 0.5)
+                new_parts_mask = candidate_mask & (~anchor_mask)
+                
+                if not np.any(new_parts_mask): continue
+
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    new_parts_mask.astype(np.uint8), 8, cv2.CV_32S
+                )
+
+                if num_labels <= 1: continue
+
+                for i in range(1, num_labels):
+                    component_mask = (labels == i)
+                    component_area = stats[i, cv2.CC_STAT_AREA]
+
+                    if not (min_area < component_area < max_area):
+                        continue
+
+                    min_dist = np.min(dist_map[component_mask])
+                    
+                    if min_dist >= max_dist_threshold:
+                        continue
+                    
+                    proximity_score = 1.0 - (min_dist / max_dist_threshold)
+                    solidity_score = self.calculate_solidity_score(component_mask)
+                    final_graft_score = (proximity_score * 0.4) + (solidity_score * 0.6)
+                    
+                    if final_graft_score > 0.55:
+                        potential_grafts.append({
+                            'score': final_graft_score,
+                            'mask': component_mask,
+                            'dist': min_dist,
+                            'area': component_area,
+                            'solidity': solidity_score
+                        })
+                        
+            if not potential_grafts:
+                return anchor_mask.astype(np.uint8)
+
+            sorted_grafts = sorted(potential_grafts, key=lambda x: x['score'], reverse=True)
             
-            contours, _ = cv2.findContours(smoothed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            closed_mask = remove_small_holes(smoothed_mask.astype(bool), area_threshold=500)
+            grafted_mask = anchor_mask.copy()
+            for graft in sorted_grafts:
+                if np.any(grafted_mask & graft['mask']):
+                    continue
 
-            bridged_mask = closing(closed_mask, footprint=disk(10))
+                grafted_mask = np.logical_or(grafted_mask, graft['mask'])
 
-            bridged_mask_uint8 = (bridged_mask > 0).astype(np.uint8)
-
-            contours, _ = cv2.findContours(bridged_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                print("  WARNING: No contours after bridging. Fallback to original mask.")
-                return base_mask.astype(np.float32)
-
-            main_contour = max(contours, key=cv2.contourArea)
-
-            hull = cv2.convexHull(main_contour)
-            hull_area = cv2.contourArea(hull)
-            contour_area = cv2.contourArea(main_contour)
-
-            solidity = contour_area / hull_area if hull_area > 0 else 0
-            image_area = h * w
-            area_ratio = contour_area / image_area if image_area > 0 else 0
-
-            if solidity < 0.85 and area_ratio > 0.8:
-                print(f"  WARNING: Refinement failed sanity check (solidity: {solidity:.2f}, area: {area_ratio:.2f}). Falling back.")
-                return base_mask.astype(np.float32)
-
-            final_filled_mask = np.zeros_like(bridged_mask_uint8)
-            cv2.drawContours(final_filled_mask, [main_contour], -1, color=1, thickness=cv2.FILLED)
-
-            pixels_added_filling = int(np.sum(final_filled_mask)) - int(np.sum(smoothed_mask))
-            print(f"  Step 2 (Hole Fill): Added {pixels_added_filling} pixels by filling main contour.")
-
-            original_pixels = int(np.sum(base_mask.astype(np.int64)))
-            final_pixels = int(np.sum(final_filled_mask.astype(np.int64)))
-            print(f"  Refinement complete. Original pixels: {original_pixels}, Final pixels: {final_pixels}")
-
-            return final_filled_mask.astype(np.float32)
+            return grafted_mask.astype(np.uint8)
 
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error during mask refinement: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            try:
-                if 'best_mask_data' in locals() and 'mask' in best_mask_data:
-                    return (best_mask_data['mask'] > 0.5).astype(np.float32)
-                return np.zeros((100, 100), dtype=np.float32)
-            except:
-                return np.zeros((100, 100), dtype=np.float32)
+            print(f"ERROR during satellite grafting: {e}")
+            return (best_mask_data.get('mask', np.zeros((1,1))) > 0.5).astype(np.uint8)
+    
     def calculate_comprehensive_shape_score(self, mask_np):
         try:
             if mask_np.sum() == 0: return 0.0
@@ -593,72 +393,17 @@ class ForbiddenVisionFaceDetector:
         except Exception as e:
             print(f"Error analyzing mask geometry: {e}")
             return None
-    def create_mask_based_zones(self, mask_np, mask_geometry):
-        try:
-            if mask_geometry is None:
-                return None
-                
-            h, w = mask_np.shape
-            centroid_x, centroid_y = mask_geometry['centroid']
-            min_x, min_y, max_x, max_y = mask_geometry['bbox']
-            mask_height = mask_geometry['height']
-            mask_width = mask_geometry['width']
-            
-            zones = {}
-            
-            upper_third_y = min_y + int(mask_height * 0.33)
-            lower_third_y = min_y + int(mask_height * 0.67)
-            
-            eye_zone = np.zeros((h, w), dtype=np.uint8)
-            eye_zone[min_y:upper_third_y, min_x:max_x] = 1
-            zones['eye_zone'] = eye_zone
-            
-            nose_zone = np.zeros((h, w), dtype=np.uint8)
-            nose_zone[upper_third_y:lower_third_y, min_x:max_x] = 1
-            zones['nose_zone'] = nose_zone
-            
-            mouth_zone = np.zeros((h, w), dtype=np.uint8)
-            mouth_zone[lower_third_y:max_y, min_x:max_x] = 1
-            zones['mouth_zone'] = mouth_zone
-            
-            core_face_kernel_size = max(5, int(min(mask_width, mask_height) * 0.1))
-            if core_face_kernel_size % 2 == 0:
-                core_face_kernel_size += 1
-            core_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_face_kernel_size, core_face_kernel_size))
-            
-            mask_uint8 = (mask_np > 0.5).astype(np.uint8)
-            core_face_region = cv2.erode(mask_uint8, core_kernel, iterations=1)
-            zones['core_face'] = core_face_region
-            
-            safe_fill_kernel_size = max(3, int(min(mask_width, mask_height) * 0.05))
-            if safe_fill_kernel_size % 2 == 0:
-                safe_fill_kernel_size += 1
-            safe_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (safe_fill_kernel_size, safe_fill_kernel_size))
-
-            safe_fill_boundary = cv2.dilate(mask_uint8, safe_kernel, iterations=1)
-            zones['safe_fill_boundary'] = safe_fill_boundary
-            
-            zones['centroid'] = (centroid_x, centroid_y)
-            zones['mask_bounds'] = (min_x, min_y, max_x, max_y)
-            
-            return zones
-            
-        except Exception as e:
-            print(f"Error creating mask-based zones: {e}")
-            return None
+    
     def _recompose_mask_with_detail_preservation(self, processed_mask, original_mask, min_hole_area_threshold, noise_threshold):
         try:
-            print("  Performing final shape-aware recomposition to preserve sharp insets...")
             
             final_contours, _ = cv2.findContours(processed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not final_contours:
-                print("  Warning: Processed mask has no contours. Cannot perform recomposition.")
                 return processed_mask
 
             solid_silhouette = np.zeros_like(processed_mask)
             final_main_contour = max(final_contours, key=cv2.contourArea)
             cv2.drawContours(solid_silhouette, [final_main_contour], -1, color=1, thickness=cv2.FILLED)
-            print("  Created temporary solid mask for comparison.")
 
             filled_details = cv2.subtract(solid_silhouette, original_mask)
             
@@ -667,14 +412,13 @@ class ForbiddenVisionFaceDetector:
             major_fills_mask = np.zeros_like(filled_details)
             
             if num_labels <= 1:
-                print("  No filled regions to analyze.")
+                
                 return processed_mask
             
             h, w = processed_mask.shape
             mask_area = np.sum(original_mask > 0)
             mask_center_x, mask_center_y = w // 2, h // 2
             
-            print(f"  Analyzing {num_labels-1} filled regions with multi-factor approach...")
             
             for i in range(1, num_labels):
                 component_area = stats[i, cv2.CC_STAT_AREA]
@@ -704,36 +448,27 @@ class ForbiddenVisionFaceDetector:
                 
                 if should_keep_filled:
                     major_fills_mask[labels == i] = 1
-                    print(f"    - Keeping fill for component {i} (area: {component_area}, size: {relative_size:.3f}, centrality: {centrality_score:.2f}) as facial feature.")
                 elif should_restore_detail:
-                    print(f"    - Discarding fill for component {i} (area: {component_area}, edge_prox: {edge_proximity:.2f}, solidity: {solidity:.2f}) to restore sharp detail.")
+                    pass  # Do nothing - don't fill this component
                 else:
                     major_fills_mask[labels == i] = 1
-                    print(f"    - Keeping fill for component {i} (area: {component_area}, solidity: {solidity:.2f}) as uncertain case - staying filled.")
 
             recomposed_mask = cv2.bitwise_or(original_mask, major_fills_mask)
-            print("  Final recomposition complete.")
 
-            print(f"  Performing final polish with noise threshold of {noise_threshold} pixels...")
             mask_bool = recomposed_mask > 0
             cleaned_mask_bool = remove_small_objects(mask_bool, min_size=noise_threshold)
             cleaned_mask_bool = remove_small_holes(cleaned_mask_bool, area_threshold=noise_threshold)
             final_cleaned_mask = cleaned_mask_bool.astype(np.uint8)
-            print("  Final polish complete.")
-
             return final_cleaned_mask
 
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
             print(f"Error during final mask recomposition: {e}")
-            import traceback
-            traceback.print_exc()
             return processed_mask
-    def generate_sam_mask_for_face(self, face_data, face_index):
+    def generate_sam_mask_for_face(self, face_data, face_index, sam_threshold, attempt_face_completion=False):
         try:
             check_for_interruption()
-            print(f"--- Processing Face {face_index + 1} using 'Silhouette and Filler' strategy ---")
 
             bbox = face_data['bbox']
             full_image = self.full_image_for_sam
@@ -750,26 +485,29 @@ class ForbiddenVisionFaceDetector:
 
             all_masks_data = []
             for i, (m, s) in enumerate(zip(all_masks, all_scores)):
-                cleaned_mask_for_scoring = self.light_cleanup_for_scoring(m.astype(np.float32), min_area=50)
-                if np.sum(cleaned_mask_for_scoring) == 0: continue
+                if np.sum(m) == 0: continue
                 all_masks_data.append({
                     'index': i,
-                    'mask': cleaned_mask_for_scoring,
-                    'original_mask': (m > 0.5).astype(np.uint8),
+                    'mask': (m > sam_threshold).astype(np.uint8),
+                    'original_mask': (m > sam_threshold).astype(np.uint8),
                     'sam_score': s
                 })
 
             best_base_data = self.select_best_mask(all_masks_data, crop_bbox)
 
             if not best_base_data:
-                print("Warning: No suitable base mask was selected. Returning empty mask.")
+
                 self.sam_predictor.set_image(full_image, image_format='RGB')
                 return []
-            
-            UncleanedOriginalMask = (best_base_data['mask'] > 0.5).astype(np.uint8)
+
+            if attempt_face_completion:
+                grafted_mask = self._graft_satellite_masks(best_base_data, all_masks_data, crop_bbox)
+            else:
+                grafted_mask = (best_base_data['original_mask'] > 0.5).astype(np.uint8)
+
+            UncleanedOriginalMask = grafted_mask
             BaseSilhouetteMask = UncleanedOriginalMask.copy()
             
-            print("  Refining with Silhouette and Filler strategy (using Morphological Closing)...")
             
             mask_geometry = self.analyze_mask_geometry(BaseSilhouetteMask.astype(np.float32))
             if mask_geometry:
@@ -785,10 +523,7 @@ class ForbiddenVisionFaceDetector:
                 min_kernel_size = max(3, int(fallback_size * 0.05))
                 stencil_kernel_size = max(min_kernel_size, int(fallback_size * 0.20))
                 dynamic_noise_threshold = max(3, int(fallback_size * 0.05))
-            
-            print(f"  Using dynamic noise threshold of {dynamic_noise_threshold} pixels for all cleaning.")
-            
-            print("  Performing robust cleaning on the selected base mask...")
+
             mask_bool = UncleanedOriginalMask > 0
             mask_area = np.sum(mask_bool)
             preliminary_threshold = max(10, int(mask_area * 0.001))
@@ -801,28 +536,26 @@ class ForbiddenVisionFaceDetector:
             
             if stencil_kernel_size % 2 == 0: stencil_kernel_size += 1
             stencil_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (stencil_kernel_size, stencil_kernel_size))
-            print(f"  Creating Stencil with closing kernel of size {stencil_kernel_size}x{stencil_kernel_size}.")
+
             Stencil = cv2.morphologyEx(BaseSilhouetteMask, cv2.MORPH_CLOSE, stencil_kernel)
+            
             contours, _ = cv2.findContours(Stencil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 main_contour = max(contours, key=cv2.contourArea)
                 Stencil = np.zeros_like(Stencil)
                 cv2.drawContours(Stencil, [main_contour], -1, color=1, thickness=cv2.FILLED)
-            self.debug_save_sam_mask(Stencil.astype(np.float32), f"Face{face_index + 1}_STENCIL", crop_bbox)
+
             HoleMask = cv2.subtract(Stencil, BaseSilhouetteMask)
             
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(HoleMask, 8, cv2.CV_32S)
             
-            min_hole_area_threshold = int(np.sum(BaseSilhouetteMask) * 0.005) 
-            print(f"  Filtering holes: only filling holes larger than {min_hole_area_threshold} pixels.")
+            min_hole_area_threshold = int(np.sum(BaseSilhouetteMask) * 0.005) if np.sum(BaseSilhouetteMask) > 0 else 50
             
             FilteredHoleMask = np.zeros_like(HoleMask)
             for i in range(1, num_labels):
                 if stats[i, cv2.CC_STAT_AREA] >= min_hole_area_threshold:
                     FilteredHoleMask[labels == i] = 1
             
-            print(f"  Identified {np.sum(FilteredHoleMask > 0)} pixels in {cv2.connectedComponents(FilteredHoleMask)[0] - 1} significant holes to be filled.")
-            self.debug_save_sam_mask(FilteredHoleMask.astype(np.float32), f"Face{face_index + 1}_FILTERED_HOLES", crop_bbox)
             AccumulatedPatch = np.zeros_like(BaseSilhouetteMask)
             
             if 'complementary_masks' in best_base_data and np.any(FilteredHoleMask):
@@ -833,7 +566,6 @@ class ForbiddenVisionFaceDetector:
                 
                 if expand_size % 2 == 0: expand_size += 1
                 expand_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (expand_size, expand_size))
-                print(f"  Using expansion kernel of size {expand_size}x{expand_size} for grafting.")
 
                 for comp in best_base_data['complementary_masks']:
                     ComplementaryMask = comp['original_mask']
@@ -844,19 +576,16 @@ class ForbiddenVisionFaceDetector:
                         FinalPatch = cv2.bitwise_and(DilatedPatch, FilteredHoleMask)
                         AccumulatedPatch = cv2.bitwise_or(AccumulatedPatch, FinalPatch)
                 
-                print(f"  Accumulated {np.sum(AccumulatedPatch > 0)} pixels from {len(best_base_data['complementary_masks'])} complementary masks.")
-                self.debug_save_sam_mask(AccumulatedPatch.astype(np.float32), f"Face{face_index + 1}_ACCUMULATED_PATCH", crop_bbox)
+          
             MergedMask = cv2.bitwise_or(BaseSilhouetteMask, AccumulatedPatch)
-            self.debug_save_sam_mask(MergedMask.astype(np.float32), f"Face{face_index + 1}_MERGED_MASK", crop_bbox)
             if mask_geometry:
                 bridge_size = max(5, int(min(mask_geometry['width'], mask_geometry['height']) * 0.05))
             else:
                 bridge_size = 7
             if bridge_size % 2 == 0: bridge_size += 1
             bridge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_size, bridge_size))
-            print(f"  Bridging disconnected components with kernel of size {bridge_size}x{bridge_size}.")
+            
             BridgedMask = cv2.morphologyEx(MergedMask, cv2.MORPH_CLOSE, bridge_kernel)
-            self.debug_save_sam_mask(BridgedMask.astype(np.float32), f"Face{face_index + 1}_BEFORE_RECOMPOSITION", crop_bbox)
             final_mask_crop = self._recompose_mask_with_detail_preservation(
                 processed_mask=BridgedMask, 
                 original_mask=OriginalChosenMask, 
@@ -867,13 +596,10 @@ class ForbiddenVisionFaceDetector:
             self.sam_predictor.set_image(full_image, image_format='RGB')
             full_size_mask = np.zeros((fh, fw), dtype=np.float32)
             full_size_mask[cy1:cy2, cx1:cx2] = final_mask_crop.astype(np.float32)
-            self.debug_save_sam_mask(full_size_mask, f"Face{face_index + 1}_FINAL_MASK_REFINED", bbox)
-            # Final speck removal
             final_mask_bool = final_mask_crop > 0
             final_mask_bool = remove_small_objects(final_mask_bool, min_size=dynamic_noise_threshold * 2)
             final_mask_crop = final_mask_bool.astype(np.float32)
 
-            # Update the full_size_mask with the cleaned crop
             full_size_mask = np.zeros((fh, fw), dtype=np.float32)
             full_size_mask[cy1:cy2, cx1:cx2] = final_mask_crop
             return [full_size_mask]
@@ -882,141 +608,11 @@ class ForbiddenVisionFaceDetector:
             raise
         except Exception as e:
             print(f"Error in segmentation for face {face_index + 1}: {e}")
-            import traceback
-            traceback.print_exc()
             if hasattr(self, 'full_image_for_sam'): 
                 self.sam_predictor.set_image(self.full_image_for_sam, 'RGB')
             return []
 
-    def generate_sam_mask_for_segment(self, seg_data, seg_index):
-        try:
-            check_for_interruption()
-            print(f"--- Processing Segment {seg_index} ---")
-
-            bbox = seg_data['bbox']
-            full_image = self.full_image_for_sam
-            fh, fw = full_image.shape[:2]
-            cx1, cy1, cx2, cy2 = self.make_crop_region(bbox, fw, fh)
-            crop_img = full_image[cy1:cy2, cx1:cx2]
-            self.sam_predictor.set_image(crop_img, image_format='RGB')
-            crop_bbox = [bbox[0]-cx1, bbox[1]-cy1, bbox[2]-cx1, bbox[3]-cy1]
-            
-            all_masks, all_scores = self.generate_sam_masks(crop_bbox)
-            if not all_masks: 
-                self.sam_predictor.set_image(full_image, image_format='RGB')
-                return []
-
-
-            all_masks_data = []
-            for i, (m, s) in enumerate(zip(all_masks, all_scores)):
-                data = {'mask': m.astype(bool)}
-                total_mask_area = np.sum(data['mask'])
-                if total_mask_area == 0: continue
-                
-                data['solidity'] = self.calculate_solidity_score(data['mask'])
-                
-                x1, y1, x2, y2 = crop_bbox
-                inside_bbox_area = np.sum(data['mask'][y1:y2, x1:x2])
-                data['outside_ratio'] = (total_mask_area - inside_bbox_area) / total_mask_area
-                all_masks_data.append(data)
-
-            good_candidates = [
-                d['mask'] for d in all_masks_data
-                if d['solidity'] > 0.80 and d['outside_ratio'] < 0.15
-            ]
-
-            if not good_candidates:
-                print("No 'excellent' masks found. Relaxing filter criteria for complex/stylized faces...")
-                good_candidates = [
-                    d['mask'] for d in all_masks_data
-                    if d['solidity'] > 0.60 and d['outside_ratio'] < 0.30
-                ]
-
-            if not good_candidates:
-                print("Warning: No usable candidate masks found even after relaxing criteria. Returning empty mask.")
-                self.sam_predictor.set_image(full_image, image_format='RGB')
-                return []
-
-            print(f"Found {len(good_candidates)} candidates to build consensus from.")
-
-            union_mask = np.zeros_like(good_candidates[0], dtype=bool)
-            for mask in good_candidates: union_mask = np.logical_or(union_mask, mask)
-
-            intersection_mask = np.ones_like(good_candidates[0], dtype=bool)
-            for mask in good_candidates: intersection_mask = np.logical_and(intersection_mask, mask)
-            
-            mask_width = crop_bbox[2] - crop_bbox[0]
-            dilation_size = max(5, int(mask_width * 0.08))
-            if dilation_size % 2 == 0: dilation_size += 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_size, dilation_size))
-            dilated_core = cv2.dilate(intersection_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-
-            combined_mask = np.logical_and(dilated_core, union_mask)
-            
-            polish_kernel_size = max(3, int(mask_width * 0.02))
-            if polish_kernel_size % 2 == 0: polish_kernel_size += 1
-            polish_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (polish_kernel_size, polish_kernel_size))
-            final_mask = cv2.morphologyEx(combined_mask.astype(np.uint8), cv2.MORPH_CLOSE, polish_kernel)
-
-            self.sam_predictor.set_image(full_image, image_format='RGB')
-            full_size_mask = np.zeros((fh, fw), dtype=np.float32)
-            full_size_mask[cy1:cy2, cx1:cx2] = final_mask.astype(np.float32)
-            
-            self.debug_save_sam_mask(full_size_mask, f"Seg{seg_index}_FINAL_MASK", bbox)
-            return [full_size_mask]
-
-        except Exception as e:
-            print(f"Error in segmentation: {e}")
-            import traceback
-            traceback.print_exc()
-            if hasattr(self, 'full_image_for_sam'): 
-                self.sam_predictor.set_image(self.full_image_for_sam, 'RGB')
-            return []
-    def refine_face_contour(self, mask_np, tight_bbox):
-        try:
-            if mask_np.sum() == 0: return mask_np
-            
-            mask_uint8 = (mask_np > 0.5).astype(np.uint8)
-            
-            contours, hierarchy = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours: return mask_np
-            
-            x1, y1, x2, y2 = tight_bbox
-            bbox_area = (x2 - x1) * (y2 - y1)
-            
-            valid_contours = []
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if 0.4 * bbox_area <= area <= 0.9 * bbox_area:
-                    M = cv2.moments(contour)
-                    if M["m00"] > 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
-                        bbox_cx = (x1 + x2) / 2
-                        bbox_cy = (y1 + y2) / 2
-                        
-                        if (abs(cx - bbox_cx) < 0.25 * (x2 - x1) and 
-                            abs(cy - bbox_cy) < 0.25 * (y2 - y1)):
-                            valid_contours.append((contour, area))
-            
-            if not valid_contours:
-                largest_contour = max(contours, key=cv2.contourArea)
-                valid_contours = [(largest_contour, cv2.contourArea(largest_contour))]
-            
-            main_contour = max(valid_contours, key=lambda x: x[1])[0]
-            
-            refined_mask = np.zeros_like(mask_uint8)
-            
-            epsilon = 0.005 * cv2.arcLength(main_contour, True)
-            smoothed_contour = cv2.approxPolyDP(main_contour, epsilon, True)
-            
-            cv2.fillPoly(refined_mask, [smoothed_contour], 1)
-            
-            return refined_mask.astype(np.float32)
-        except Exception as e:
-            print(f"Error in contour refinement: {e}")
-            return mask_np
-    def detect_faces_with_sam_refinement(self, image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection):
+    def detect_faces_with_sam_refinement(self, image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection, attempt_face_completion=False):
         try:
             check_for_interruption()
             detected_faces = self.detect_faces_bbox_only(image_tensor, bbox_model_name, detection_confidence)
@@ -1030,7 +626,7 @@ class ForbiddenVisionFaceDetector:
             all_final_masks = []
             for i, face_data in enumerate(detected_faces):
                 check_for_interruption()
-                generated_masks = self.generate_sam_mask_for_face(face_data, i)
+                generated_masks = self.generate_sam_mask_for_face(face_data, i, sam_threshold, attempt_face_completion)
                 if generated_masks: all_final_masks.extend(generated_masks)
             
             if not all_final_masks:
@@ -1044,13 +640,11 @@ class ForbiddenVisionFaceDetector:
             raise
         except Exception as e: 
             print(f"Error in two-stage detection: {e}")
-            import traceback
-            traceback.print_exc()
             return []
 
-    def detect_faces(self, image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection):
+    def detect_faces(self, image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection, attempt_face_completion=False):
         if sam_model_name and sam_model_name != "None Found":
-            return self.detect_faces_with_sam_refinement(image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection)
+            return self.detect_faces_with_sam_refinement(image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection, attempt_face_completion)
         else:
             detected_segments = self.detect_faces_bbox_only(image_tensor, bbox_model_name, detection_confidence)
             masks = [seg['mask'] for seg in detected_segments if 'mask' in seg]
@@ -1069,35 +663,13 @@ class ForbiddenVisionFaceDetector:
             if not results or results[0].boxes is None: return []
             
             detected_segments = []
-            for i, box in enumerate(results[0].boxes):
+            for box in results[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 if (x2 - x1) < 20 or (y2 - y1) < 20: continue
                 rect_mask = np.zeros((h, w), dtype=np.float32); rect_mask[y1:y2, x1:x2] = 1.0
                 detected_segments.append({'bbox': [x1, y1, x2, y2], 'mask': rect_mask})
             
-            self.debug_save_yolo_detection(image_uint8, detected_segments, "Stage1_Detection")
             return detected_segments
         except Exception as e: 
             print(f"Error in BBOX detection: {e}")
-            import traceback; traceback.print_exc()
             return []
-    def debug_save_yolo_detection(self, image_uint8, detected_segments, stage_name):
-        try:
-            debug_dir = os.path.join(folder_paths.get_output_directory(), "debug_yolo_detection")
-            os.makedirs(debug_dir, exist_ok=True)
-            img = Image.fromarray(image_uint8); draw = ImageDraw.Draw(img)
-            for seg in detected_segments: draw.rectangle(seg['bbox'], outline=(0, 255, 0), width=4)
-            img.save(os.path.join(debug_dir, f"{int(time.time() * 1000)}_{stage_name}.png"))
-        except Exception as e: print(f"Error saving YOLO debug: {e}")
-
-    def debug_save_sam_mask(self, mask, filename_suffix, bbox=None, score=None):
-        try:
-            debug_dir = os.path.join(folder_paths.get_output_directory(), "debug_sam_masks")
-            os.makedirs(debug_dir, exist_ok=True)
-            mask_np = mask.cpu().numpy() if isinstance(mask, torch.Tensor) else mask
-            mask_img = Image.fromarray((np.clip(mask_np.squeeze(),0,1)*255).astype(np.uint8), 'L').convert("RGB")
-            draw = ImageDraw.Draw(mask_img)
-            if bbox: draw.rectangle(list(map(int, bbox)), outline=(255,0,0), width=2)
-            if score is not None: draw.text((10, 10), f"Score: {score:.3f}", fill=(0, 255, 0))
-            mask_img.save(os.path.join(debug_dir, f"{int(time.time() * 1000)}_{filename_suffix}.png"))
-        except Exception as e: print(f"Error saving debug SAM mask: {e}")

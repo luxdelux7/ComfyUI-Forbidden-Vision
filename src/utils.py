@@ -6,7 +6,6 @@ import folder_paths
 import comfy.model_management as model_management
 
 def check_for_interruption():
-    """Check if ComfyUI has requested cancellation"""
     if model_management.processing_interrupted():
         raise model_management.InterruptProcessingException()
 def ensure_model_directories():
@@ -19,18 +18,10 @@ def ensure_model_directories():
             os.path.join(folder_paths.models_dir, "sams"),
             os.path.join(folder_paths.models_dir, "ultralytics"),
         ]
-        
-        created_dirs = []
+
         for dir_path in required_dirs:
             if not os.path.exists(dir_path):
                 os.makedirs(dir_path, exist_ok=True)
-                created_dirs.append(dir_path)
-                print(f"Created model directory: {dir_path}")
-        
-        if created_dirs:
-            print(f"Created {len(created_dirs)} missing model directories")
-        else:
-            print("All model directories already exist")
             
         return True
         
@@ -38,10 +29,6 @@ def ensure_model_directories():
         print(f"Error creating model directories: {e}")
         return False
 def find_model_path(model_name, model_type):
-    """
-    Finds the full path for a given model name and type ('yolo' or 'sam').
-    This is the single source of truth for model locations.
-    """
     if not model_name or model_name == "None Found":
         return None
     
@@ -71,7 +58,6 @@ def find_model_path(model_name, model_type):
     return None
 
 def get_yolo_models():
-    """Scans for YOLO bbox models and returns a prioritized list."""
     search_paths = [
         os.path.join(folder_paths.models_dir, "ultralytics", "bbox"),
         os.path.join(folder_paths.models_dir, "ultralytics"),
@@ -93,7 +79,6 @@ def get_yolo_models():
     return final_list if final_list else ["None Found"]
 
 def get_sam_models():
-    """Scans for regular SAM models only (no SAM2)."""
     search_paths = [
         os.path.join(folder_paths.models_dir, "sams"),
         os.path.join(folder_paths.models_dir, "sam"),
@@ -118,7 +103,6 @@ def get_sam_models():
     return final_list if final_list else ["None Found"]
 
 def safe_tensor_to_numpy(tensor, target_range=(0, 255)):
-    """Safely convert tensor to numpy with proper range handling."""
     try:
         if len(tensor.shape) == 4:
             np_array = tensor.squeeze(0)
@@ -139,7 +123,6 @@ def safe_tensor_to_numpy(tensor, target_range=(0, 255)):
         return np.zeros((512, 512, 3), dtype=np.uint8 if target_range == (0, 255) else np.float32)
 
 def safe_numpy_to_tensor(np_array, input_range=(0, 255)):
-    """Safely convert numpy to tensor with proper range handling."""
     try:
         if input_range == (0, 255):
             tensor = torch.from_numpy(np_array).float() / 255.0
@@ -153,22 +136,3 @@ def safe_numpy_to_tensor(np_array, input_range=(0, 255)):
     except Exception as e:
         print(f"Error in numpy conversion: {e}")
         return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
-
-def process_mask_morphology(mask, expansion=0, blur_size=0, blur_sigma=1.0):
-    try:
-        working_mask = mask.copy()
-        
-        if expansion > 0:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (expansion*2+1, expansion*2+1))
-            working_mask = cv2.dilate(working_mask, kernel, iterations=1)
-
-        if blur_size > 0:
-            kernel_size = max(3, int(blur_size))
-            if kernel_size % 2 == 0:
-                kernel_size += 1
-            working_mask = cv2.GaussianBlur(working_mask, (kernel_size, kernel_size), blur_sigma)
-            
-        return np.clip(working_mask, 0.0, 1.0)
-    except Exception as e:
-        print(f"Error in mask processing: {e}")
-        return mask

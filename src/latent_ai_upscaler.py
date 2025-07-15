@@ -79,19 +79,16 @@ class LatentAIUpscaler:
             
             check_for_interruption()
             
-            # Get original and target dimensions
             h, w = decoded_image.shape[1], decoded_image.shape[2]
             target_h, target_w = int(h * upscale_factor), int(w * upscale_factor)
             
             final_image = ai_upscaled_image
-            # If the AI upscaled image is not already at the target size, resize it.
             if ai_upscaled_image.shape[1] != target_h or ai_upscaled_image.shape[2] != target_w:
-                # Use antialias=True for high-quality downsampling that prevents aliasing artifacts.
                 final_image = F.interpolate(ai_upscaled_image.movedim(-1, 1), 
                                             size=(target_h, target_w), 
                                             mode='bicubic', 
                                             align_corners=False,
-                                            antialias=True) # THIS IS THE KEY ADDITION
+                                            antialias=True)
                 final_image = final_image.movedim(1, -1)
 
             check_for_interruption()
@@ -101,13 +98,12 @@ class LatentAIUpscaler:
 
             check_for_interruption()
 
-            # Ensure final image is on the correct device before encoding
             final_image = final_image.to(device)
 
             if use_tiled_vae:
                 VAEEncodeTiledClass = nodes.NODE_CLASS_MAPPINGS['VAEEncodeTiled']
                 encoder = VAEEncodeTiledClass()
-                vae_overlap = 64 # A common default
+                vae_overlap = 64
                 upscaled_latent = encoder.encode(vae, final_image, tile_size, vae_overlap)[0]
             else:
                 VAEEncodeClass = nodes.NODE_CLASS_MAPPINGS['VAEEncode']
@@ -124,9 +120,6 @@ class LatentAIUpscaler:
             raise
         except Exception as e:
             print(f"Error in Latent AI Upscaler: {e}")
-            import traceback
-            traceback.print_exc()
-            # Return latent in the original device state to prevent downstream errors
             return ({"samples": latent["samples"]}, torch.zeros((1, 64, 64, 3), dtype=torch.float32))
    
     def get_color_matrices(self, device, dtype):

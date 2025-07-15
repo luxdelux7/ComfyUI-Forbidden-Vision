@@ -2,27 +2,21 @@ import torch
 import numpy as np
 import cv2
 import comfy.model_management as model_management
-from .utils import check_for_interruption, safe_tensor_to_numpy
+from .utils import check_for_interruption
 
 class ForbiddenVisionMaskProcessor:
     def __init__(self):
         pass
 
     def polish_mask(self, mask_np):
-        """
-        Performs a final, robust polishing of a generated mask using a two-pass strategy.
-        This is designed to effectively remove noise and smooth jagged edges.
-        """
         try:
             if mask_np is None or np.sum(mask_np) == 0:
                 return mask_np
 
             from skimage.morphology import remove_small_objects, remove_small_holes, closing, opening, disk
 
-            # Ensure we are working with a boolean mask for skimage functions
             mask_bool = (mask_np > 0.5)
 
-            # 1. Initial cleanup of disconnected specks and pinholes
             total_pixels = np.sum(mask_bool)
             speck_threshold = min(100, max(20, int(total_pixels * 0.0005)))
             cleaned_mask_bool = remove_small_objects(mask_bool, min_size=speck_threshold)
@@ -30,29 +24,22 @@ class ForbiddenVisionMaskProcessor:
             hole_threshold = min(150, max(30, int(total_pixels * 0.001)))
             filled_mask_bool = remove_small_holes(cleaned_mask_bool, area_threshold=hole_threshold)
             
-            # 2. Two-Pass Polishing Strategy
-            # This is more effective than a single operation.
             
-            # Find the mask's bounding box to create dynamic structuring elements
             rows = np.any(filled_mask_bool, axis=1)
             cols = np.any(filled_mask_bool, axis=0)
             if not np.any(rows) or not np.any(cols):
-                return filled_mask_bool.astype(np.float32) # Return early if mask is empty
+                return filled_mask_bool.astype(np.float32)
 
             ymin, ymax = np.where(rows)[0][[0, -1]]
             xmin, xmax = np.where(cols)[0][[0, -1]]
             w, h = xmax - xmin, ymax - ymin
 
-            # --- Pass 1: Aggressive Closing to absorb fuzz and connect gaps ---
-            # Use a larger, dynamic disk to make the shape solid.
-            closing_radius = int(min(w, h) * 0.02) # 2% of the smallest dimension
-            closing_radius = np.clip(closing_radius, 2, 8) # Clamp for safety (radius of 2-8 pixels)
+            closing_radius = int(min(w, h) * 0.02)
+            closing_radius = np.clip(closing_radius, 2, 8)
             
             closed_mask = closing(filled_mask_bool, footprint=disk(closing_radius))
 
-            # --- Pass 2: Gentle Opening to smooth the contour ---
-            # Use a smaller, fixed disk to refine the edges without shrinking the main body.
-            opening_radius = 2 # A fixed radius of 2 is effective for smoothing without being destructive
+            opening_radius = 2
             
             final_mask_bool = opening(closed_mask, footprint=disk(opening_radius))
 
@@ -65,9 +52,6 @@ class ForbiddenVisionMaskProcessor:
             return mask_np
                 
     def process_and_crop(self, image_tensor, mask_tensor, crop_padding, processing_resolution, mask_expansion, enable_pre_upscale=False, upscaler_model_name=None, upscaler_loader_callback=None, upscaler_run_callback=None):
-        """
-        Orchestrates mask processing: cropping and resizing for inpainting.
-        """
         try:
             check_for_interruption()
             
@@ -172,8 +156,6 @@ class ForbiddenVisionMaskProcessor:
             raise
         except Exception as e:
             print(f"Error during mask processing and cropping: {e}")
-            import traceback
-            traceback.print_exc()
             return self.create_empty_outputs(image_tensor, processing_resolution)
 
     def create_empty_outputs(self, image_tensor, target_size):

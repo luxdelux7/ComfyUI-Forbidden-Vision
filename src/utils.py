@@ -10,9 +10,7 @@ def check_for_interruption():
     if model_management.processing_interrupted():
         raise model_management.InterruptProcessingException()
 def ensure_model_directories():
-    """
-    Create model directories if they don't exist, following Impact Pack structure
-    """
+
     try:
         import os
         

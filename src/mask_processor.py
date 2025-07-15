@@ -8,9 +8,65 @@ class ForbiddenVisionMaskProcessor:
     def __init__(self):
         pass
 
-    def process_and_crop(self, image_tensor, mask_tensor, enable_cleanup, crop_padding, processing_resolution, mask_expansion, enable_pre_upscale=False, upscaler_model_name=None, upscaler_loader_callback=None, upscaler_run_callback=None):
+    def polish_mask(self, mask_np):
         """
-        Orchestrates mask processing: cleanup, cropping, and resizing for inpainting.
+        Performs a final, robust polishing of a generated mask using a two-pass strategy.
+        This is designed to effectively remove noise and smooth jagged edges.
+        """
+        try:
+            if mask_np is None or np.sum(mask_np) == 0:
+                return mask_np
+
+            from skimage.morphology import remove_small_objects, remove_small_holes, closing, opening, disk
+
+            # Ensure we are working with a boolean mask for skimage functions
+            mask_bool = (mask_np > 0.5)
+
+            # 1. Initial cleanup of disconnected specks and pinholes
+            total_pixels = np.sum(mask_bool)
+            speck_threshold = min(100, max(20, int(total_pixels * 0.0005)))
+            cleaned_mask_bool = remove_small_objects(mask_bool, min_size=speck_threshold)
+            
+            hole_threshold = min(150, max(30, int(total_pixels * 0.001)))
+            filled_mask_bool = remove_small_holes(cleaned_mask_bool, area_threshold=hole_threshold)
+            
+            # 2. Two-Pass Polishing Strategy
+            # This is more effective than a single operation.
+            
+            # Find the mask's bounding box to create dynamic structuring elements
+            rows = np.any(filled_mask_bool, axis=1)
+            cols = np.any(filled_mask_bool, axis=0)
+            if not np.any(rows) or not np.any(cols):
+                return filled_mask_bool.astype(np.float32) # Return early if mask is empty
+
+            ymin, ymax = np.where(rows)[0][[0, -1]]
+            xmin, xmax = np.where(cols)[0][[0, -1]]
+            w, h = xmax - xmin, ymax - ymin
+
+            # --- Pass 1: Aggressive Closing to absorb fuzz and connect gaps ---
+            # Use a larger, dynamic disk to make the shape solid.
+            closing_radius = int(min(w, h) * 0.02) # 2% of the smallest dimension
+            closing_radius = np.clip(closing_radius, 2, 8) # Clamp for safety (radius of 2-8 pixels)
+            
+            closed_mask = closing(filled_mask_bool, footprint=disk(closing_radius))
+
+            # --- Pass 2: Gentle Opening to smooth the contour ---
+            # Use a smaller, fixed disk to refine the edges without shrinking the main body.
+            opening_radius = 2 # A fixed radius of 2 is effective for smoothing without being destructive
+            
+            final_mask_bool = opening(closed_mask, footprint=disk(opening_radius))
+
+            return final_mask_bool.astype(np.float32)
+
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            print(f"Warning: Error during final mask polishing: {e}. Returning unpolished mask.")
+            return mask_np
+                
+    def process_and_crop(self, image_tensor, mask_tensor, crop_padding, processing_resolution, mask_expansion, enable_pre_upscale=False, upscaler_model_name=None, upscaler_loader_callback=None, upscaler_run_callback=None):
+        """
+        Orchestrates mask processing: cropping and resizing for inpainting.
         """
         try:
             check_for_interruption()
@@ -45,11 +101,7 @@ class ForbiddenVisionMaskProcessor:
             x1, x2 = initial_coords[1].min(), initial_coords[1].max()
             mask_bbox = (x1, y1, x2, y2)
             
-            if enable_cleanup:
-                cleaned_mask = self.advanced_mask_cleanup(mask_float, mask_bbox)
-                blend_mask = cleaned_mask
-            else:
-                blend_mask = mask_float
+            blend_mask = mask_float
 
             if mask_expansion > 0:
                 expand_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mask_expansion*2+1, mask_expansion*2+1))
@@ -123,64 +175,6 @@ class ForbiddenVisionMaskProcessor:
             import traceback
             traceback.print_exc()
             return self.create_empty_outputs(image_tensor, processing_resolution)
-
-    def advanced_mask_cleanup(self, mask, mask_bbox):
-        """
-        Optimized mask cleanup using efficient morphological operations.
-        """
-        try:
-            if mask is None or np.sum(mask) == 0:
-                return mask
-            print(f"DEBUG: Mask cleanup input - non-zero pixels: {np.sum(mask > 0.5)}")  # ADD THIS
-            x1, y1, x2, y2 = mask_bbox
-            mask_width = x2 - x1
-            
-            kernel_size = max(3, int(mask_width * 0.15))
-            if kernel_size % 2 == 0: 
-                kernel_size += 1
-
-            binary_mask = (mask > 0.5).astype(np.uint8)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-            
-            closed_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
-            
-            num_labels, labels, stats = cv2.connectedComponentsWithStats(closed_mask, 8, cv2.CV_32S)[:3]
-            print(f"DEBUG: Found {num_labels-1} connected components")  # ADD THIS
-            if num_labels <= 1:
-                return closed_mask.astype(np.float32)
-            
-            largest_idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-            print(f"DEBUG: Keeping largest component {largest_idx}, discarding {num_labels-2} others")  # ADD THIS
-            result_mask = (labels == largest_idx).astype(np.float32)
-            print(f"DEBUG: Mask cleanup output - non-zero pixels: {np.sum(result_mask > 0.5)}")  # ADD THIS
-            y_coords, x_coords = np.where(result_mask > 0)
-            if len(y_coords) > 0:
-                y_min, y_max = y_coords.min(), y_coords.max()
-                x_min, x_max = x_coords.min(), x_coords.max()
-                
-                pad = min(10, mask_width // 10)
-                y_min = max(0, y_min - pad)
-                y_max = min(mask.shape[0], y_max + pad)
-                x_min = max(0, x_min - pad)
-                x_max = min(mask.shape[1], x_max + pad)
-                
-                crop_region = result_mask[y_min:y_max, x_min:x_max]
-                
-                h_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 1))
-                v_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 3))
-                
-                filled_crop = cv2.morphologyEx(crop_region.astype(np.uint8), cv2.MORPH_CLOSE, h_kernel)
-                filled_crop = cv2.morphologyEx(filled_crop, cv2.MORPH_CLOSE, v_kernel)
-                
-                result_mask[y_min:y_max, x_min:x_max] = filled_crop.astype(np.float32)
-            
-            return result_mask
-
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error during mask cleanup: {e}")
-            return mask
 
     def create_empty_outputs(self, image_tensor, target_size):
         empty_face = torch.zeros((1, target_size, target_size, 3), dtype=torch.float32)

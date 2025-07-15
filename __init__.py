@@ -1,9 +1,10 @@
-from .utils import ensure_model_directories
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-ensure_model_directories()
-
-from .face_processor_integrated import ForbiddenVisionFaceProcessorIntegrated
-from .latent_ai_upscaler import LatentAIUpscaler
+from .src.utils import ensure_model_directories
+from .src.face_processor_integrated import ForbiddenVisionFaceProcessorIntegrated
+from .src.latent_ai_upscaler import LatentAIUpscaler
 
 NODE_CLASS_MAPPINGS = {
     "ForbiddenVisionFaceProcessorIntegrated": ForbiddenVisionFaceProcessorIntegrated,

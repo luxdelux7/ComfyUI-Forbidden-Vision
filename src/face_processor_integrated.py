@@ -39,10 +39,8 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 "processing_resolution": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64, "tooltip": "The resolution at which the cropped mask area will be processed."}),
                 "enable_pre_upscale": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Enable to upscale small faces with an AI model before processing."}),
                 "upscaler_model": (ForbiddenVisionFaceProcessorIntegrated.get_ordered_upscaler_models(), {"tooltip": "The AI model used for pre-upscaling small faces. Only active if 'enable_pre_upscale' is on."}),
-                "crop_padding": ("FLOAT", {"default": 1.2, "min": 1.0, "max": 2.0, "step": 0.1, "tooltip": "Padding added to the mask's bounding box before cropping."}),
+                "crop_padding": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 2.0, "step": 0.1, "tooltip": "Padding added to the mask's bounding box before inpaint."}),
                 
-                "enable_mask_cleanup": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Enable intelligent cleanup to fill holes and remove noise from the input mask."}),
-
                 "face_positive_prompt": ("STRING", {"multiline": True, "default": "face focus"}),
                 "face_negative_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "replace_positive_prompt": ("BOOLEAN", {"default": False}),
@@ -255,7 +253,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             return original_image
     def process_face_complete(self, image, model, vae, positive, negative, 
                             steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                            processing_resolution, enable_pre_upscale, upscaler_model, crop_padding, enable_mask_cleanup,
+                            processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
                             face_positive_prompt, face_negative_prompt, replace_positive_prompt, replace_negative_prompt,
                             blend_softness, mask_expansion,
                             sampling_mask_blur_size, sampling_mask_blur_strength,
@@ -295,7 +293,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             sampling_cache_key = self.get_sampling_cache_key_only(
                 image, mask, model, vae, positive, negative, steps, cfg_scale, sampler, scheduler, 
                 denoise_strength, seed, processing_resolution, enable_pre_upscale, upscaler_model, crop_padding, 
-                enable_mask_cleanup, face_positive_prompt, face_negative_prompt, replace_positive_prompt, 
+                face_positive_prompt, face_negative_prompt, replace_positive_prompt, 
                 replace_negative_prompt, mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, 
                 enable_vertical_flip, face_selection, clip, detection_confidence, sam_threshold, bbox_model, sam_model
             )
@@ -328,7 +326,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                     processed_result = self.process_single_face_unified(
                         original_base_image, face_mask, model, vae, positive, negative,
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed + i,
-                        processing_resolution, enable_pre_upscale, upscaler_model, crop_padding, enable_mask_cleanup,
+                        processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
                         face_positive_prompt, face_negative_prompt, replace_positive_prompt, replace_negative_prompt,
                         mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, clip
                     )
@@ -383,7 +381,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
     
     def get_sampling_cache_key_only(self, image, mask, model, vae, positive, negative,
                                 steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                                processing_resolution, enable_pre_upscale, upscaler_model, crop_padding, enable_mask_cleanup,
+                                processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
                                 face_positive_prompt, face_negative_prompt, replace_positive_prompt, replace_negative_prompt,
                                 mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength,
                                 enable_vertical_flip, face_selection, clip,
@@ -420,7 +418,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 image_hash, mask_hash, tuple(image.shape),
                 model_hash, vae_hash, pos_hash, neg_hash,
                 steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                processing_resolution, enable_pre_upscale, upscaler_model, crop_padding, enable_mask_cleanup,
+                processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
                 face_pos_hash, face_neg_hash, replace_positive_prompt, replace_negative_prompt,
                 mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength,
                 enable_vertical_flip, face_selection, clip_hash
@@ -441,12 +439,9 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error generating compositing cache key: {e}")
             return None
     
-    
-    
-
     def process_single_face_unified(self, image, mask, model, vae, positive, negative,
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                        processing_resolution, enable_pre_upscale, upscaler_model, crop_padding, enable_mask_cleanup,
+                        processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
                         face_positive_prompt, face_negative_prompt, replace_positive_prompt, replace_negative_prompt,
                         mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, clip):
         """Unified method to process a single face"""
@@ -457,7 +452,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             cropped_face, sampler_mask_batch, restore_info = self.mask_processor.process_and_crop(
                 image_tensor=image, 
                 mask_tensor=mask, 
-                enable_cleanup=enable_mask_cleanup,
                 crop_padding=crop_padding, 
                 processing_resolution=processing_resolution, 
                 mask_expansion=mask_expansion,
@@ -575,7 +569,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             return original_image
 
     def create_unified_mask(self, restore_info_list, image):
-        """Create unified mask from all processed faces"""
+        """Create and polish a unified mask from all processed faces."""
         try:
             if not restore_info_list:
                 image_shape = image.shape
@@ -594,9 +588,12 @@ class ForbiddenVisionFaceProcessorIntegrated:
                     combined_mask = np.maximum(combined_mask, blend_mask)
                 else:
                     print(f"DEBUG: Face {i} has no blend_mask")
+
+            # Unconditionally polish the final combined mask for the best possible output
+            polished_mask = self.mask_processor.polish_mask(combined_mask)
             
-            print(f"DEBUG: Final combined mask has {np.sum(combined_mask > 0)} non-zero pixels")
-            return torch.from_numpy(combined_mask).unsqueeze(0)
+            print(f"DEBUG: Final polished mask has {np.sum(polished_mask > 0)} non-zero pixels")
+            return torch.from_numpy(polished_mask).unsqueeze(0)
             
         except model_management.InterruptProcessingException:
             raise

@@ -8,8 +8,6 @@ from PIL import Image
 
 class ForbiddenVisionFaceDetector:
     def __init__(self):
-        from .utils import ensure_model_directories
-        ensure_model_directories()
         self.sam_model, self.sam_predictor, self.sam_model_name = None, None, None
         self.bbox_model, self.bbox_model_name = None, None
 

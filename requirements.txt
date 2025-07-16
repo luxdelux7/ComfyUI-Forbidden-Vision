@@ -3,3 +3,4 @@ ultralytics
 opencv-python-headless
 numpy
 scikit-image
+kornia

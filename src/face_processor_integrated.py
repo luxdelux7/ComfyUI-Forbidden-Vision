@@ -10,9 +10,10 @@ import comfy.samplers
 import comfy.sample
 import latent_preview
 import cv2
+import kornia
 from .face_detector import ForbiddenVisionFaceDetector
 from .mask_processor import ForbiddenVisionMaskProcessor
-from .utils import safe_tensor_to_numpy, safe_numpy_to_tensor, check_for_interruption, get_yolo_models, get_sam_models
+from .utils import check_for_interruption, get_yolo_models, get_sam_models, get_ordered_upscaler_model_list
 
 class ForbiddenVisionFaceProcessorIntegrated:
     @classmethod
@@ -34,7 +35,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 
                 "processing_resolution": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64, "tooltip": "The resolution at which the cropped mask area will be processed."}),
                 "enable_pre_upscale": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Enable to upscale small faces with an AI model before processing."}),
-                "upscaler_model": (ForbiddenVisionFaceProcessorIntegrated.get_ordered_upscaler_models(), {"tooltip": "The AI model used for pre-upscaling small faces. Only active if 'enable_pre_upscale' is on."}),
+                "upscaler_model": (get_ordered_upscaler_model_list(), {"tooltip": "The AI model used for pre-upscaling small faces. Only active if 'enable_pre_upscale' is on."}),
                 "crop_padding": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 2.0, "step": 0.1, "tooltip": "Padding added to the mask's bounding box before inpaint."}),
                 
                 "face_positive_prompt": ("STRING", {"multiline": True, "default": "face focus"}),
@@ -161,19 +162,126 @@ class ForbiddenVisionFaceProcessorIntegrated:
         upscaled_np_uint8 = (np.clip(upscaled_np, 0, 1) * 255.0).round().astype(np.uint8)
 
         return upscaled_np_uint8
-    
-    def combine_all_faces_to_final_image(self, original_image, all_processed_faces, all_restore_info, blend_softness, enable_color_correction=False, color_correction_strength=1.0):
+    def _perform_color_correction_gpu(self, processed_face_tensor, original_crop_tensor, correction_strength):
+        try:
+            check_for_interruption()
+            
+            # Ensure tensors are in the correct format (B, C, H, W) and float32
+            processed_face_permuted = processed_face_tensor.permute(0, 3, 1, 2).float()
+            original_crop_permuted = original_crop_tensor.permute(0, 3, 1, 2).float()
+
+            # Resize original crop to match processed face size
+            original_face_resized = F.interpolate(
+                original_crop_permuted, 
+                size=processed_face_permuted.shape[2:], 
+                mode='bicubic', 
+                align_corners=False, 
+                antialias=True
+            )
+
+            # Convert to LAB color space on GPU
+            processed_lab = kornia.color.rgb_to_lab(processed_face_permuted)
+            target_lab = kornia.color.rgb_to_lab(original_face_resized)
+
+            # Calculate stats on GPU
+            source_mean = torch.mean(processed_lab, dim=(2, 3), keepdim=True)
+            source_std = torch.std(processed_lab, dim=(2, 3), keepdim=True)
+            target_mean = torch.mean(target_lab, dim=(2, 3), keepdim=True)
+            target_std = torch.std(target_lab, dim=(2, 3), keepdim=True)
+            
+            # Apply color transfer on GPU
+            result_lab = (processed_lab - source_mean) * (target_std / (source_std + 1e-6)) + target_mean
+            
+            # Convert back to RGB on GPU
+            corrected_face_permuted = kornia.color.lab_to_rgb(result_lab)
+
+            # Blend with original based on strength
+            if correction_strength < 1.0:
+                corrected_face_permuted = processed_face_permuted * (1.0 - correction_strength) + corrected_face_permuted * correction_strength
+            
+            # Clamp and permute back to (B, H, W, C)
+            final_tensor = torch.clamp(corrected_face_permuted, 0.0, 1.0).permute(0, 2, 3, 1)
+
+            return final_tensor
+
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            print(f"Error in GPU color correction: {e}. Returning original processed tensor.")
+            return processed_face_tensor
+
+    def create_compositing_blend_mask_gpu(self, clean_sam_mask_tensor, blend_softness):
+        try:
+            check_for_interruption()
+            
+            if blend_softness <= 0:
+                return (clean_sam_mask_tensor > 0.5).float()
+
+            h, w = clean_sam_mask_tensor.shape[1], clean_sam_mask_tensor.shape[2]
+            
+            # Ensure mask is a 4D tensor (B, C, H, W) for Kornia
+            mask_4d = clean_sam_mask_tensor.unsqueeze(0)
+            
+            core_mask = (mask_4d > 0.5).float()
+            
+            # Calculate dynamic kernel sizes on GPU
+            mask_size = max(w, h, 1)
+            blend_ratio = blend_softness / 400.0
+            
+            # Dilation for blur expansion
+            expand_amount = int(mask_size * blend_ratio * 0.8)
+            if expand_amount > 0:
+                expand_kernel_size = expand_amount * 2 + 1
+                expand_kernel = torch.ones(expand_kernel_size, expand_kernel_size, device=mask_4d.device)
+                expanded_for_blur = kornia.morphology.dilation(core_mask, expand_kernel)
+            else:
+                expanded_for_blur = core_mask
+
+            # Gaussian blur for feathering
+            blur_amount = int(mask_size * blend_ratio * 1.2)
+            blur_kernel_size = max(3, blur_amount * 2 + 1)
+            sigma = blur_kernel_size / 3.0 # Approximate sigma
+            feathering_zone = kornia.filters.gaussian_blur2d(
+                expanded_for_blur, (blur_kernel_size, blur_kernel_size), (sigma, sigma)
+            )
+
+            # Combine core mask and feathering zone
+            final_mask = torch.max(core_mask, feathering_zone)
+
+            # Edge Fading
+            fade_pixels = int(min(h, w) * 0.02)
+            if fade_pixels > 0:
+                fade_y = torch.linspace(0.0, 1.0, steps=fade_pixels, device=final_mask.device)
+                fade_x = torch.linspace(0.0, 1.0, steps=fade_pixels, device=final_mask.device)
+                final_mask[:, :, :fade_pixels, :] *= fade_y.view(1, 1, -1, 1)
+                final_mask[:, :, h-fade_pixels:, :] *= torch.flip(fade_y, [0]).view(1, 1, -1, 1)
+                final_mask[:, :, :, :fade_pixels] *= fade_x.view(1, 1, 1, -1)
+                final_mask[:, :, :, w-fade_pixels:] *= torch.flip(fade_x, [0]).view(1, 1, 1, -1)
+
+            final_mask[:, :, 0, :], final_mask[:, :, -1, :], final_mask[:, :, :, 0], final_mask[:, :, :, -1] = 0, 0, 0, 0
+
+            return torch.clamp(final_mask.squeeze(0), 0.0, 1.0)
+
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            print(f"Error creating GPU hybrid blend mask: {e}")
+            return (clean_sam_mask_tensor > 0.5).float()
+    def combine_all_faces_to_final_image(self, original_image_tensor, all_processed_faces, all_restore_info, blend_softness, enable_color_correction=False, color_correction_strength=1.0):
         try:
             check_for_interruption()
             
             if not all_processed_faces or not all_restore_info:
-                return original_image
+                return original_image_tensor
 
-            original_np = self.fast_tensor_to_numpy(original_image.clone(), target_range=(0, 1))
-            h, w = original_np.shape[:2]
+            device = original_image_tensor.device
+            h, w = original_image_tensor.shape[1], original_image_tensor.shape[2]
 
-            new_faces_canvas = original_np.copy()
-            unified_compositing_mask = np.zeros((h, w), dtype=np.float32)
+            # Start with the original image tensor on the GPU
+            final_canvas_tensor = original_image_tensor.clone()
+            
+            # Create a unified mask for compositing on the GPU
+            unified_compositing_mask = torch.zeros((1, h, w), device=device)
 
             for processed_face_tensor, restore_info in zip(all_processed_faces, all_restore_info):
                 check_for_interruption()
@@ -188,49 +296,54 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 if actual_crop_w <= 0 or actual_crop_h <= 0:
                     continue
 
-                processed_face_np = self.fast_tensor_to_numpy(processed_face_tensor, target_range=(0, 1))
-                
-                if enable_color_correction and color_correction_strength > 0.0:
-                    original_crop_np = original_np[crop_y1:crop_y2, crop_x1:crop_x2]
+                # Ensure processed face is on the correct device
+                processed_face_tensor = processed_face_tensor.to(device)
 
-                    processed_face_np = self._perform_color_correction(
-                        processed_face_np, original_crop_np, color_correction_strength
+                # Perform color correction on GPU
+                if enable_color_correction and color_correction_strength > 0.0:
+                    original_crop_tensor = original_image_tensor[:, crop_y1:crop_y2, crop_x1:crop_x2, :]
+                    processed_face_tensor = self._perform_color_correction_gpu(
+                        processed_face_tensor, original_crop_tensor, color_correction_strength
                     )
 
-                resized_processed_face = self.high_quality_resize(
-                    processed_face_np, (actual_crop_w, actual_crop_h)
-                )
+                # Resize processed face on GPU
+                resized_processed_face = F.interpolate(
+                    processed_face_tensor.permute(0, 3, 1, 2), # B, C, H, W
+                    size=(actual_crop_h, actual_crop_w),
+                    mode='bicubic',
+                    align_corners=False,
+                    antialias=True
+                ).permute(0, 2, 3, 1) # B, H, W, C
                 
-                new_faces_canvas[crop_y1:crop_y2, crop_x1:crop_x2] = resized_processed_face
+                # Place the resized face onto a temporary canvas
+                temp_face_canvas = torch.zeros_like(final_canvas_tensor)
+                temp_face_canvas[:, crop_y1:crop_y2, crop_x1:crop_x2, :] = resized_processed_face
 
-                full_blend_mask = restore_info.get("blend_mask")
+                # Create the blend mask for this specific face on GPU
+                full_blend_mask = torch.from_numpy(restore_info.get("blend_mask")).to(device)
                 if full_blend_mask is None:
-                    paste_mask_crop = np.ones((actual_crop_h, actual_crop_w), dtype=np.float32)
+                    paste_mask_crop = torch.ones((actual_crop_h, actual_crop_w), device=device)
                 else:
                     paste_mask_crop = full_blend_mask[crop_y1:crop_y2, crop_x1:crop_x2]
 
-                compositing_mask_crop = self.create_compositing_blend_mask(paste_mask_crop, blend_softness)
+                compositing_mask_crop = self.create_compositing_blend_mask_gpu(paste_mask_crop.unsqueeze(0), blend_softness)
                 
-                unified_compositing_mask[crop_y1:crop_y2, crop_x1:crop_x2] = np.maximum(
-                    unified_compositing_mask[crop_y1:crop_y2, crop_x1:crop_x2],
-                    compositing_mask_crop
-                )
+                # Place the crop's mask onto a full-size mask canvas
+                temp_mask_canvas = torch.zeros_like(unified_compositing_mask)
+                temp_mask_canvas[:, crop_y1:crop_y2, crop_x1:crop_x2] = compositing_mask_crop
+                
+                # Blend the temporary face canvas with the main canvas using the temporary mask
+                final_canvas_tensor = temp_face_canvas * temp_mask_canvas.unsqueeze(-1) + final_canvas_tensor * (1.0 - temp_mask_canvas.unsqueeze(-1))
 
             check_for_interruption()
-
-            unified_compositing_mask_3d = np.stack([unified_compositing_mask] * 3, axis=-1)
             
-            final_result_np = (new_faces_canvas * unified_compositing_mask_3d) + (original_np * (1.0 - unified_compositing_mask_3d))
-            
-            final_tensor = self.fast_numpy_to_tensor(final_result_np, input_range=(0, 1))
-            
-            return final_tensor
+            return final_canvas_tensor
 
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error combining faces to final image: {e}")
-            return original_image
+            print(f"Error combining faces to final image on GPU: {e}")
+            return original_image_tensor
     def process_face_complete(self, image, model, vae, positive, negative, 
                             steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
                             processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
@@ -472,44 +585,59 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
     def create_combined_face_output(self, processed_faces, processing_resolution):
         try:
+            check_for_interruption()
+
             if not processed_faces:
-                return torch.zeros((1, processing_resolution, processing_resolution, 3))
+                return torch.zeros((1, processing_resolution, processing_resolution, 3), device=model_management.get_torch_device())
             
             if len(processed_faces) == 1:
                 return processed_faces[0]
             
-            face_crops = []
-            for processed_face in processed_faces:
-                processed_np = self.fast_tensor_to_numpy(processed_face, target_range=(0, 255))
-                processed_resized = cv2.resize(processed_np, (processing_resolution, processing_resolution), interpolation=cv2.INTER_CUBIC)
-                face_crops.append(processed_resized)
+            device = processed_faces[0].device
+            face_tensors = []
+            for face_tensor in processed_faces:
+                # Permute to (B, C, H, W) for interpolate
+                face_permuted = face_tensor.to(device).permute(0, 3, 1, 2)
+                resized_face = F.interpolate(
+                    face_permuted, 
+                    size=(processing_resolution, processing_resolution), 
+                    mode='bicubic', 
+                    align_corners=False,
+                    antialias=True
+                )
+                # Permute back to (B, H, W, C)
+                face_tensors.append(resized_face.permute(0, 2, 3, 1))
             
-            if len(face_crops) == 2:
-                combined = np.concatenate(face_crops, axis=1)
+            if len(face_tensors) == 2:
+                combined = torch.cat(face_tensors, dim=2) # Concatenate along width
             else:
                 rows = []
-                for i in range(0, len(face_crops), 2):
-                    row_faces = face_crops[i:i+2]
+                for i in range(0, len(face_tensors), 2):
+                    row_faces = face_tensors[i:i+2]
                     if len(row_faces) == 1:
-                        row_faces.append(np.zeros_like(row_faces[0]))
-                    row = np.concatenate(row_faces, axis=1)
+                        # Add a black tensor if there's an odd number of faces
+                        black_tensor = torch.zeros_like(row_faces[0])
+                        row_faces.append(black_tensor)
+                    row = torch.cat(row_faces, dim=2) # Concatenate along width
                     rows.append(row)
-                combined = np.concatenate(rows, axis=0)
+                combined = torch.cat(rows, dim=1) # Concatenate rows along height
             
-            return self.fast_numpy_to_tensor(combined, input_range=(0, 255))
+            return combined
             
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error creating combined face output: {e}")
-            return processed_faces[0] if processed_faces else torch.zeros((1, processing_resolution, processing_resolution, 3))
+            print(f"Error creating GPU-based combined face output: {e}")
+            return processed_faces[0] if processed_faces else torch.zeros((1, processing_resolution, processing_resolution, 3), device=model_management.get_torch_device())
 
     def create_unified_comparison(self, original_image, processed_faces, restore_info_list, processing_resolution):
         try:
+            check_for_interruption()
+
             if not processed_faces or not restore_info_list:
                 return original_image
             
-            original_np = self.fast_tensor_to_numpy(original_image, target_range=(0, 255))
+            device = original_image.device
             comparisons = []
             
             for processed_face, restore_info in zip(processed_faces, restore_info_list):
@@ -519,58 +647,76 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
                     continue
                 
-                original_crop = original_np[crop_y1:crop_y2, crop_x1:crop_x2]
-                original_resized = cv2.resize(original_crop, (processing_resolution, processing_resolution), interpolation=cv2.INTER_CUBIC)
+                # Slice the original image on the GPU
+                original_crop = original_image[:, crop_y1:crop_y2, crop_x1:crop_x2, :]
                 
-                processed_np = self.fast_tensor_to_numpy(processed_face, target_range=(0, 255))
-                processed_resized = cv2.resize(processed_np, (processing_resolution, processing_resolution), interpolation=cv2.INTER_CUBIC)
+                # Resize original crop on GPU
+                original_resized = F.interpolate(
+                    original_crop.permute(0, 3, 1, 2),
+                    size=(processing_resolution, processing_resolution),
+                    mode='bicubic', align_corners=False, antialias=True
+                ).permute(0, 2, 3, 1)
+
+                # Resize processed face on GPU
+                processed_resized = F.interpolate(
+                    processed_face.to(device).permute(0, 3, 1, 2),
+                    size=(processing_resolution, processing_resolution),
+                    mode='bicubic', align_corners=False, antialias=True
+                ).permute(0, 2, 3, 1)
                 
-                face_comparison = np.concatenate([original_resized, processed_resized], axis=1)
+                # Concatenate side-by-side on GPU
+                face_comparison = torch.cat([original_resized, processed_resized], dim=2) # Cat along width
                 comparisons.append(face_comparison)
             
             if not comparisons:
                 return original_image
             
-            if len(comparisons) == 1:
-                final_comparison = comparisons[0]
-            else:
-                final_comparison = np.concatenate(comparisons, axis=0)
+            # Stack all comparisons vertically on GPU
+            final_comparison = torch.cat(comparisons, dim=1) # Cat along height
             
-            return self.fast_numpy_to_tensor(final_comparison, input_range=(0, 255))
+            return final_comparison
             
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error creating unified comparison: {e}")
+            print(f"Error creating GPU-based unified comparison: {e}")
             return original_image
 
     def create_unified_mask(self, restore_info_list, image):
         try:
-            if not restore_info_list:
-                image_shape = image.shape
-                return torch.zeros((1, image_shape[1], image_shape[2]), dtype=torch.float32)
-            
-            
+            check_for_interruption()
+
             image_shape = image.shape
             original_height, original_width = image_shape[1], image_shape[2]
-            combined_mask = np.zeros((original_height, original_width), dtype=np.float32)
+            device = image.device
+            
+            if not restore_info_list:
+                return torch.zeros((1, original_height, original_width), dtype=torch.float32, device=device)
+            
+            combined_mask = torch.zeros((1, original_height, original_width), dtype=torch.float32, device=device)
             
             for restore_info in restore_info_list:
-                blend_mask = restore_info.get("blend_mask")
-                if blend_mask is not None:
-                    combined_mask = np.maximum(combined_mask, blend_mask)
+                blend_mask_np = restore_info.get("blend_mask")
+                if blend_mask_np is not None:
+                    # Transfer mask to GPU once and combine using torch.maximum
+                    blend_mask_tensor = torch.from_numpy(blend_mask_np).to(device)
+                    combined_mask = torch.maximum(combined_mask, blend_mask_tensor)
 
-            polished_mask = self.mask_processor.polish_mask(combined_mask)
+            # Move the single combined mask to CPU for the CPU-only polishing step
+            combined_mask_np = combined_mask.squeeze(0).cpu().numpy()
             
-            return torch.from_numpy(polished_mask).unsqueeze(0)
+            # Polish on CPU
+            polished_mask_np = self.mask_processor.polish_mask(combined_mask_np)
+            
+            # Return the final polished mask as a tensor on the correct device
+            return torch.from_numpy(polished_mask_np).unsqueeze(0).to(device)
             
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
             print(f"Error creating unified mask: {e}")
             image_shape = image.shape
-            return torch.zeros((1, image_shape[1], image_shape[2]), dtype=torch.float32)
-        
+            return torch.zeros((1, image_shape[1], image_shape[2]), dtype=torch.float32, device=image.device)
     
     def process_single_face_sampling(self, cropped_face, face_mask, model, vae, positive, negative,
                                     steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
@@ -600,32 +746,38 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error in single face sampling: {e}")
             raise e
     
-
     def create_safe_fallback_outputs(self, image, processing_resolution):
         try:
-            final_output = image.clone() if image is not None else torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+            device = model_management.get_torch_device()
             
-            empty_processed = torch.zeros((1, processing_resolution, processing_resolution, 3), dtype=torch.float32)
-            empty_mask = torch.zeros((1, 512, 512), dtype=torch.float32)
+            final_output = image.clone().to(device) if image is not None else torch.zeros((1, 512, 512, 3), dtype=torch.float32, device=device)
+            
+            empty_processed = torch.zeros((1, processing_resolution, processing_resolution, 3), dtype=torch.float32, device=device)
 
             if image is not None:
-                original_np = self.tensor_to_numpy_comparison(image)
-                h, w = original_np.shape[:2]
-                black_side = np.zeros_like(original_np)
-                comparison_np = np.concatenate([original_np, black_side], axis=1)
-                empty_comparison = self.numpy_to_tensor_comparison(comparison_np)
-                empty_mask = torch.zeros((1, h, w), dtype=torch.float32)
+                h, w = image.shape[1], image.shape[2]
+                black_side = torch.zeros_like(image)
+                # Create side-by-side comparison on GPU
+                empty_comparison = torch.cat([image, black_side], dim=2)
+                empty_mask = torch.zeros((1, h, w), dtype=torch.float32, device=device)
             else:
-                empty_comparison = torch.zeros((1, 512, 1024, 3), dtype=torch.float32)
+                # Default sizes if no image is provided
+                h, w = 512, 512
+                empty_comparison = torch.zeros((1, h, w * 2, 3), dtype=torch.float32, device=device)
+                empty_mask = torch.zeros((1, h, w), dtype=torch.float32, device=device)
             
             return (final_output, empty_processed, empty_comparison, empty_mask)
+            
         except model_management.InterruptProcessingException:
             raise
-        except:
-            fallback_img = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
-            fallback_mask = torch.zeros((1, 512, 512), dtype=torch.float32)
-            return (fallback_img, fallback_img, fallback_img, fallback_mask)
-
+        except Exception as e:
+            print(f"Error creating safe fallback outputs: {e}")
+            device = model_management.get_torch_device()
+            fallback_img = torch.zeros((1, 512, 512, 3), dtype=torch.float32, device=device)
+            fallback_mask = torch.zeros((1, 512, 512), dtype=torch.float32, device=device)
+            # Ensure the comparison image has the correct double-width shape
+            fallback_comp = torch.zeros((1, 512, 1024, 3), dtype=torch.float32, device=device)
+            return (fallback_img, fallback_img, fallback_comp, fallback_mask)
     
     def enhance_conditioning_with_face_prompts(self, positive, negative, face_positive_prompt, face_negative_prompt, replace_positive_prompt, replace_negative_prompt, clip):
         try:
@@ -680,65 +832,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error modifying {prompt_type} conditioning: {e}")
             return conditioning
 
-    def tensor_to_numpy_comparison(self, tensor):
-        return self.fast_tensor_to_numpy(tensor, target_range=(0, 255))
-
-    def numpy_to_tensor_comparison(self, np_array):
-        return self.fast_numpy_to_tensor(np_array, input_range=(0, 255))
     
-    def _perform_color_correction(self, processed_face_np, original_crop_np, correction_strength):
-        try:
-            original_face_resized = cv2.resize(original_crop_np,
-                                            (processed_face_np.shape[1], processed_face_np.shape[0]),
-                                            interpolation=cv2.INTER_CUBIC)
-
-            corrected_face = self.lab_color_transfer(processed_face_np, original_face_resized)
-
-            if correction_strength < 1.0:
-                corrected_face = processed_face_np * (1.0 - correction_strength) + corrected_face * correction_strength
-
-            return np.clip(corrected_face, 0.0, 1.0)
-
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in _perform_color_correction helper: {e}")
-            return processed_face_np
-        
-    def lab_color_transfer(self, source_image, target_image):
-        try:
-            if source_image.shape != target_image.shape:
-                target_image = cv2.resize(target_image, (source_image.shape[1], source_image.shape[0]))
-            
-            source_uint8 = (np.clip(source_image, 0, 1) * 255).astype(np.uint8)
-            target_uint8 = (np.clip(target_image, 0, 1) * 255).astype(np.uint8)
-            
-            source_lab = cv2.cvtColor(source_uint8, cv2.COLOR_RGB2LAB).astype(np.float32)
-            target_lab = cv2.cvtColor(target_uint8, cv2.COLOR_RGB2LAB).astype(np.float32)
-            
-            source_mean = np.mean(source_lab.reshape(-1, 3), axis=0)
-            source_std = np.std(source_lab.reshape(-1, 3), axis=0)
-            
-            target_mean = np.mean(target_lab.reshape(-1, 3), axis=0)
-            target_std = np.std(target_lab.reshape(-1, 3), axis=0)
-            
-            result_lab = source_lab.copy()
-            
-            for i in range(3):
-                if source_std[i] > 1e-6:
-                    result_lab[:, :, i] = (result_lab[:, :, i] - source_mean[i]) * (target_std[i] / source_std[i]) + target_mean[i]
-            
-            result_lab = np.clip(result_lab, 0, 255)
-            result_rgb = cv2.cvtColor(result_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
-            
-            return result_rgb.astype(np.float32) / 255.0
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in LAB color transfer: {e}")
-            return source_image
-
     def is_empty_detection(self, cropped_face, restore_info):
         try:
             if isinstance(restore_info, list):
@@ -768,28 +862,45 @@ class ForbiddenVisionFaceProcessorIntegrated:
   
     def process_inpaint_mask(self, face_mask, latent_height, latent_width, device, blur_size, blur_strength):
         try:
-            mask_tensor = face_mask.reshape(1, 1, face_mask.shape[-2], face_mask.shape[-1])
-            resized_mask = torch.nn.functional.interpolate(mask_tensor, size=(latent_height, latent_width), mode='bilinear', align_corners=False).squeeze(1)
-
-            resized_mask_np = resized_mask.cpu().numpy().squeeze()
+            check_for_interruption()
             
+            # Reshape and resize the mask on the GPU.
+            # We keep it as a 4D tensor (B, C, H, W) as Kornia prefers this format.
+            mask_4d = face_mask.reshape(1, 1, face_mask.shape[-2], face_mask.shape[-1])
+            resized_mask_4d = F.interpolate(mask_4d, size=(latent_height, latent_width), mode='bilinear', align_corners=False)
+
             if blur_size > 1 and blur_strength > 0:
-                base_sigma = (blur_size - 1) / 8.0
-                actual_sigma = base_sigma * (1 + np.tanh(blur_strength - 1) * 2)
+                # Use standard math library for scalar calculations. It's fast and avoids numpy.
+                import math
                 
+                # Ensure blur_size is odd
                 if blur_size % 2 == 0:
                     blur_size += 1
                 
-                blurred_mask = cv2.GaussianBlur(resized_mask_np, (blur_size, blur_size), actual_sigma)
-                resized_mask = torch.from_numpy(blurred_mask).unsqueeze(0).to(device)
+                # Calculate sigma using standard math, not numpy
+                base_sigma = (blur_size - 1) / 8.0
+                actual_sigma = base_sigma * (1 + math.tanh(blur_strength - 1) * 2)
+                
+                # Apply Gaussian blur on the GPU using Kornia
+                blurred_mask_4d = kornia.filters.gaussian_blur2d(
+                    resized_mask_4d, (blur_size, blur_size), (actual_sigma, actual_sigma)
+                )
+                
+                # Return the final blurred mask as a 3D tensor (B, H, W) for the KSampler
+                return blurred_mask_4d.squeeze(1)
 
-            return resized_mask
+            # If no blur is applied, just return the resized mask as a 3D tensor
+            return resized_mask_4d.squeeze(1)
+
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error processing inpaint mask: {e}")
-            return resized_mask
-   
+            print(f"Error processing inpaint mask on GPU: {e}")
+            # A safe fallback in case of an error during processing
+            if 'resized_mask_4d' in locals():
+                return resized_mask_4d.squeeze(1)
+            else:
+                return torch.zeros((face_mask.shape[0], latent_height, latent_width), device=device)
 
     def encode_image_to_latent(self, image, vae):
         try:
@@ -912,125 +1023,3 @@ class ForbiddenVisionFaceProcessorIntegrated:
         except Exception as e:
             print(f"Error preparing conditioning: {e}")
             return conditioning
-
-    def high_quality_resize(self, image_float, target_size):
-        try:
-            target_w, target_h = target_size
-            current_h, current_w = image_float.shape[:2]
-            
-            if target_w <= 0 or target_h <= 0: 
-                return image_float
-            if current_w == target_w and current_h == target_h:
-                return image_float
-                
-            if image_float.dtype != np.float32: 
-                image_float = image_float.astype(np.float32)
-            
-            scale_factor = min(target_w / current_w, target_h / current_h)
-            
-            if scale_factor > 1.0:
-                return cv2.resize(image_float, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-            elif scale_factor > 0.75:
-                return cv2.resize(image_float, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-            else:
-                resized = cv2.resize(image_float, (target_w, target_h), interpolation=cv2.INTER_AREA)
-                if scale_factor < 0.5:
-                    amount = 0.3
-                    sigma = 0.6
-                    blurred = cv2.GaussianBlur(resized, (0, 0), sigma)
-                    detail = resized - blurred
-                    sharpened = resized + detail * amount
-                    return np.clip(sharpened, 0.0, 1.0)
-                return resized
-                
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in high quality resize: {e}")
-            return cv2.resize(image_float, target_size, interpolation=cv2.INTER_AREA)
-
-    def create_compositing_blend_mask(self, clean_sam_mask, blend_softness):
-        try:
-            if blend_softness <= 0:
-                return (clean_sam_mask > 0.5).astype(np.float32)
-            h, w = clean_sam_mask.shape[:2]
-            core_mask = (clean_sam_mask > 0.5).astype(np.uint8) * 255
-            contours, _ = cv2.findContours(core_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                return np.zeros_like(clean_sam_mask, dtype=np.float32)
-            
-            largest_contour = max(contours, key=cv2.contourArea)
-            _, _, mask_w, mask_h = cv2.boundingRect(largest_contour)
-            mask_size = max(mask_w, mask_h, 1)
-            blend_ratio = blend_softness / 400.0
-            expand_amount = int(mask_size * blend_ratio * 0.8)
-            if expand_amount > 0:
-                expand_kernel_size = expand_amount * 2 + 1
-                expand_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (expand_kernel_size, expand_kernel_size))
-                expanded_for_blur = cv2.dilate(core_mask, expand_kernel, iterations=1)
-            else:
-                expanded_for_blur = core_mask.copy()
-            blur_amount = int(mask_size * blend_ratio * 1.2)
-            blur_kernel_size = max(3, blur_amount * 2 + 1)
-            
-            feathering_zone = cv2.GaussianBlur(expanded_for_blur, (blur_kernel_size, blur_kernel_size), 0)
-            final_mask_uint8 = np.maximum(core_mask, feathering_zone)
-            final_mask_float = final_mask_uint8.astype(np.float32) / 255.0
-            fade_pixels = int(min(h, w) * 0.02)
-            if fade_pixels > 0:
-                for i in range(fade_pixels):
-                    fade_factor = i / float(fade_pixels)
-                    final_mask_float[i, :] *= fade_factor
-                    final_mask_float[h-1-i, :] *= fade_factor
-                    final_mask_float[:, i] *= fade_factor
-                    final_mask_float[:, w-1-i] *= fade_factor
-            
-            final_mask_float[0, :], final_mask_float[-1, :], final_mask_float[:, 0], final_mask_float[:, -1] = 0, 0, 0, 0
-            return np.clip(final_mask_float, 0.0, 1.0)
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error creating hybrid blend mask: {e}")
-            return (clean_sam_mask > 0.5).astype(np.float32)
-        
-    def fast_tensor_to_numpy(self, tensor, target_range=(0, 255)):
-        try:
-            if tensor.device != torch.device('cpu'):
-                tensor = tensor.cpu()
-            
-            np_array = tensor.squeeze().numpy()
-            
-            if target_range == (0, 255):
-                if np_array.max() <= 1.0:
-                    return (np_array * 255.0).astype(np.uint8)
-                else:
-                    return np.clip(np_array, 0, 255).astype(np.uint8)
-            else:
-                if np_array.max() > 1.0:
-                    return np_array / 255.0
-                else:
-                    return np_array
-                    
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in fast tensor conversion: {e}")
-            return safe_tensor_to_numpy(tensor, target_range)
-
-    def fast_numpy_to_tensor(self, np_array, input_range=(0, 255)):
-        try:
-            if input_range == (0, 255):
-                if np_array.dtype == np.uint8:
-                    tensor_data = np_array.astype(np.float32) / 255.0
-                else:
-                    tensor_data = np.clip(np_array / 255.0, 0.0, 1.0)
-            else:
-                tensor_data = np.clip(np_array, 0.0, 1.0).astype(np.float32)
-            
-            return torch.from_numpy(tensor_data).unsqueeze(0)
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in fast numpy conversion: {e}")
-            return safe_numpy_to_tensor(np_array, input_range)

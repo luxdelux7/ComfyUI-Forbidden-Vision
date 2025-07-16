@@ -102,37 +102,34 @@ def get_sam_models():
 
     return final_list if final_list else ["None Found"]
 
-def safe_tensor_to_numpy(tensor, target_range=(0, 255)):
-    try:
-        if len(tensor.shape) == 4:
-            np_array = tensor.squeeze(0)
-        else:
-            np_array = tensor
-        
-        np_array = np_array.detach().cpu()
-        np_array = torch.clamp(np_array, 0.0, 1.0)
-        
-        if target_range == (0, 255):
-            np_array = (np_array * 255.0).numpy().astype(np.uint8)
-        else:
-            np_array = np_array.numpy().astype(np.float32)
-        
-        return np_array
-    except Exception as e:
-        print(f"Error in tensor conversion: {e}")
-        return np.zeros((512, 512, 3), dtype=np.uint8 if target_range == (0, 255) else np.float32)
+def get_ordered_upscaler_model_list():
 
-def safe_numpy_to_tensor(np_array, input_range=(0, 255)):
-    try:
-        if input_range == (0, 255):
-            tensor = torch.from_numpy(np_array).float() / 255.0
-        else:
-            tensor = torch.from_numpy(np_array).float()
-        
-        if len(tensor.shape) == 3:
-            tensor = tensor.unsqueeze(0)
-        
-        return torch.clamp(tensor, 0.0, 1.0)
-    except Exception as e:
-        print(f"Error in numpy conversion: {e}")
-        return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+    preferred_models = [
+        "4x_NMKD-Siax_200k.pth",
+        "4x-UltraSharp.pth",
+        "4x_foolhardy_Remacri.pth",
+        "4x-AnimeSharp.pth"
+    ]
+    
+    all_models = folder_paths.get_filename_list("upscale_models") or []
+    if not all_models:
+        return ["None Found"]
+    
+    found_preferred = []
+    # Use a set for faster lookups of already added models
+    found_preferred_set = set()
+
+    for preferred in preferred_models:
+        for model in all_models:
+            # Check if the preferred name is a substring of the model name
+            if preferred in model:
+                if model not in found_preferred_set:
+                    found_preferred.append(model)
+                    found_preferred_set.add(model)
+
+    remaining_models = [model for model in all_models if model not in found_preferred_set]
+    
+    # Combine the lists and return
+    ordered_models = found_preferred + sorted(remaining_models)
+    
+    return ordered_models if ordered_models else ["None Found"]

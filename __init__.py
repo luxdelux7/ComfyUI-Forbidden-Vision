@@ -12,8 +12,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ForbiddenVisionFaceProcessorIntegrated": "Forbidden Vision - Face Processor",
-    "LatentRefiner": "Forbidden Vision - Latent Refiner",
+    "ForbiddenVisionFaceProcessorIntegrated": "Forbidden Vision - Fixer",
+    "LatentRefiner": "Forbidden Vision - Refiner",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

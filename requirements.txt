@@ -4,3 +4,4 @@ opencv-python-headless
 numpy
 scikit-image
 kornia
+transparent-background

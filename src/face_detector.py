@@ -1,8 +1,10 @@
 import torch
 import numpy as np
 import cv2
+import math
+from ensemble_boxes import weighted_boxes_fusion
 import comfy.model_management as model_management
-from .utils import check_for_interruption, find_model_path
+from .utils import check_for_interruption, find_model_path, clean_model_name
 from skimage.morphology import remove_small_objects, remove_small_holes, closing, disk
 from PIL import Image
 
@@ -10,36 +12,131 @@ class ForbiddenVisionFaceDetector:
     def __init__(self):
         self.sam_model, self.sam_predictor, self.sam_model_name = None, None, None
         self.bbox_model, self.bbox_model_name = None, None
+        self.bbox_model_B, self.bbox_model_B_name = None, None
+        self.yoloseg_model, self.yoloseg_model_name = None, None
+    
+    def _can_share_model(self, clean_model_name, model_type_needed):
+        """Check if we can share an already loaded model"""
+        # Never share between detection and segmentation - they use models differently
+        if model_type_needed == 'yoloseg':
+            return None  # Always load fresh for segmentation
+        
+        # Only allow sharing within detection tasks
+        if model_type_needed == 'bbox':
+            if (self.bbox_model_B is not None and self.bbox_model_B_name == clean_model_name):
+                return 'bbox_B'
+        elif model_type_needed == 'bbox_B':
+            if (self.bbox_model is not None and self.bbox_model_name == clean_model_name):
+                return 'bbox'
+        
+        return None
 
+    def _share_model_instance(self, source_type, target_type, clean_model_name):
+        """Share model instance from source to target"""
+        if source_type == 'bbox' and target_type == 'yoloseg':
+            self.yoloseg_model = self.bbox_model
+            self.yoloseg_model_name = clean_model_name
+            print(f"Shared BBOX model '{clean_model_name}' for YOLO-seg (memory efficient)")
+            return True
+        elif source_type == 'bbox_B' and target_type == 'yoloseg':
+            self.yoloseg_model = self.bbox_model_B
+            self.yoloseg_model_name = clean_model_name
+            print(f"Shared BBOX-B model '{clean_model_name}' for YOLO-seg (memory efficient)")
+            return True
+        elif source_type == 'yoloseg' and target_type == 'bbox':
+            self.bbox_model = self.yoloseg_model
+            self.bbox_model_name = clean_model_name
+            print(f"Shared YOLO-seg model '{clean_model_name}' for BBOX (memory efficient)")
+            return True
+        elif source_type == 'yoloseg' and target_type == 'bbox_B':
+            self.bbox_model_B = self.yoloseg_model
+            self.bbox_model_B_name = clean_model_name
+            print(f"Shared YOLO-seg model '{clean_model_name}' for BBOX-B (memory efficient)")
+            return True
+        elif source_type == 'bbox' and target_type == 'bbox_B':
+            self.bbox_model_B = self.bbox_model
+            self.bbox_model_B_name = clean_model_name
+            print(f"Shared BBOX model '{clean_model_name}' for BBOX-B (memory efficient)")
+            return True
+        
+        return False
+    
     def load_bbox_detector(self, model_name):
         try:
-            if self.bbox_model is not None and self.bbox_model_name == model_name: return True
-            model_path = find_model_path(model_name, 'yolo')
-            if model_path is None: print(f"Error: BBOX (YOLO) model '{model_name}' not found."); return False
+            clean_model_name_val = clean_model_name(model_name)
+            if self.bbox_model is not None and self.bbox_model_name == clean_model_name_val: return True
+            
+            share_source = self._can_share_model(clean_model_name_val, 'bbox')
+            if share_source:
+                return self._share_model_instance(share_source, 'bbox', clean_model_name_val)
+            
+            model_path = find_model_path(clean_model_name_val, 'yolo')
+            if model_path is None: print(f"Error: BBOX (YOLO) model '{clean_model_name_val}' not found."); return False
             from ultralytics import YOLO
             device = model_management.get_torch_device()
             if self.bbox_model is not None: del self.bbox_model
             self.bbox_model = YOLO(model_path); self.bbox_model.to(device)
-            self.bbox_model_name = model_name
-            print(f"Loaded BBOX model: {model_name}")
+            self.bbox_model_name = clean_model_name_val
+            print(f"Loaded BBOX model: {clean_model_name_val}")
             return True
-        except Exception as e: print(f"Error loading YOLO '{model_name}': {e}"); self.bbox_model = None; self.bbox_model_name = None; return False
-
+        except Exception as e: print(f"Error loading YOLO '{clean_model_name_val}': {e}"); self.bbox_model = None; self.bbox_model_name = None; return False
+    
+    def load_bbox_detector_B(self, model_name):
+        try:
+            clean_model_name_val = clean_model_name(model_name)
+            if self.bbox_model_B is not None and self.bbox_model_B_name == clean_model_name_val: return True
+            
+            share_source = self._can_share_model(clean_model_name_val, 'bbox_B')
+            if share_source:
+                return self._share_model_instance(share_source, 'bbox_B', clean_model_name_val)
+            
+            model_path = find_model_path(clean_model_name_val, 'yolo')
+            if model_path is None: print(f"Error: BBOX (YOLO) model '{clean_model_name_val}' not found."); return False
+            from ultralytics import YOLO
+            device = model_management.get_torch_device()
+            if self.bbox_model_B is not None: del self.bbox_model_B
+            self.bbox_model_B = YOLO(model_path); self.bbox_model_B.to(device)
+            self.bbox_model_B_name = clean_model_name_val
+            print(f"Loaded BBOX model B: {clean_model_name_val}")
+            return True
+        except Exception as e: print(f"Error loading YOLO '{clean_model_name_val}': {e}"); self.bbox_model_B = None; self.bbox_model_B_name = None; return False
+    
+    def load_yoloseg_model(self, model_name):
+        try:
+            clean_model_name_val = clean_model_name(model_name)
+            if self.yoloseg_model is not None and self.yoloseg_model_name == clean_model_name_val: return True
+            
+            share_source = self._can_share_model(clean_model_name_val, 'yoloseg')
+            if share_source:
+                return self._share_model_instance(share_source, 'yoloseg', clean_model_name_val)
+            
+            model_path = find_model_path(clean_model_name_val, 'yolo')
+            if model_path is None: print(f"Error: YOLO-seg model '{clean_model_name_val}' not found."); return False
+            from ultralytics import YOLO
+            device = model_management.get_torch_device()
+            if self.yoloseg_model is not None: del self.yoloseg_model
+            self.yoloseg_model = YOLO(model_path); self.yoloseg_model.to(device)
+            self.yoloseg_model_name = clean_model_name_val
+            print(f"Loaded YOLO-seg model: {clean_model_name_val}")
+            return True
+        except Exception as e: print(f"Error loading YOLO-seg '{clean_model_name_val}': {e}"); self.yoloseg_model = None; self.yoloseg_model_name = None; return False
+        
     def load_sam_model(self, model_name):
         try:
-            if self.sam_model is not None and self.sam_model_name == model_name: return True
-            model_path = find_model_path(model_name, 'sam')
-            if model_path is None: print(f"Error: SAM model '{model_name}' not found."); return False
+            clean_model_name_val = clean_model_name(model_name)
+            if self.sam_model is not None and self.sam_model_name == clean_model_name_val: return True
+            model_path = find_model_path(clean_model_name_val, 'sam')
+            if model_path is None: print(f"Error: SAM model '{clean_model_name_val}' not found."); return False
             from segment_anything import sam_model_registry, SamPredictor
             model_type = "default"
-            if "vit_b" in model_name: model_type = "vit_b"
-            elif "vit_l" in model_name: model_type = "vit_l"
-            elif "vit_h" in model_name: model_type = "vit_h"
+            if "vit_b" in clean_model_name_val: model_type = "vit_b"
+            elif "vit_l" in clean_model_name_val: model_type = "vit_l"
+            elif "vit_h" in clean_model_name_val: model_type = "vit_h"
             device = model_management.get_torch_device()
             self.sam_model = sam_model_registry[model_type](checkpoint=model_path); self.sam_model.to(device)
             self.sam_predictor = SamPredictor(self.sam_model)
-            self.sam_model_name = model_name
-            print(f"Loaded SAM model: {model_name}")
+            self.sam_model_name = clean_model_name_val
+            print(f"Loaded SAM model: {clean_model_name_val}")
             return True
         except Exception as e: print(f"Error loading SAM model: {e}"); self.sam_model=None; self.sam_predictor=None; self.sam_model_name=None; return False
 
@@ -82,7 +179,8 @@ class ForbiddenVisionFaceDetector:
         bw, bh = x2 - x1, y2 - y1
         ew, eh = int(bw * (crop_factor-1.0)/2.0), int(bh * (crop_factor-1.0)/2.0)
         return [max(0, x1 - ew), max(0, y1 - eh), min(w, x2 + ew), min(h, y2 + eh)]
-
+    
+   
     def select_best_mask(self, all_masks_data, tight_bbox):
 
         if not all_masks_data:
@@ -207,6 +305,312 @@ class ForbiddenVisionFaceDetector:
         if masks_box is not None: all_masks.extend(masks_box); all_scores.extend(scores_box)
         
         return all_masks, all_scores
+    def _cleanup_yoloseg_mask(self, mask_np):
+        """
+        Performs initial cleanup specifically for YOLO-seg masks.
+        Removes stray pixels and fills holes with proper resolution-based scaling.
+        """
+        try:
+            if mask_np.sum() == 0:
+                return mask_np
+            
+            mask_bool = mask_np > 0
+            mask_area = np.sum(mask_bool)
+            h, w = mask_np.shape
+            
+            if mask_area < 50:
+                return np.zeros_like(mask_np, dtype=np.uint8)
+            
+            # First pass: Remove obviously small disconnected components
+            image_diagonal = np.sqrt(h * h + w * w)
+            
+            # More aggressive thresholds for initial cleanup
+            area_based_threshold = max(15, int(mask_area * 0.01))  # 1% of mask area
+            resolution_based_threshold = max(25, int((h * w) * 0.0005))  # 0.05% of image area
+            min_component_size = max(area_based_threshold, resolution_based_threshold)
+            
+            print(f"YOLO cleanup thresholds - Image: {w}x{h}, Mask area: {mask_area}, Min component: {min_component_size}")
+            
+            # Find connected components to analyze them individually
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_bool.astype(np.uint8), 8, cv2.CV_32S)
+            
+            if num_labels <= 1:
+                # No components or just background
+                return np.zeros_like(mask_np, dtype=np.uint8)
+            
+            # Find the largest component (main face mask)
+            component_areas = stats[1:, cv2.CC_STAT_AREA]  # Skip background (index 0)
+            largest_component_idx = np.argmax(component_areas) + 1  # Add 1 because we skipped background
+            largest_area = component_areas[largest_component_idx - 1]
+            
+            print(f"Found {num_labels - 1} components. Largest: {largest_area} pixels")
+            
+            # Create cleaned mask starting with just the largest component
+            cleaned_mask = np.zeros_like(mask_bool, dtype=np.uint8)
+            cleaned_mask[labels == largest_component_idx] = 1
+            
+            # Add other components only if they're significant enough
+            for i in range(1, num_labels):
+                if i == largest_component_idx:
+                    continue  # Already added
+                    
+                component_area = stats[i, cv2.CC_STAT_AREA]
+                
+                # More stringent criteria for keeping additional components
+                if (component_area >= min_component_size and 
+                    component_area >= largest_area * 0.05):  # At least 5% of main component
+                    cleaned_mask[labels == i] = 1
+                    print(f"Kept component {i} with area {component_area}")
+                else:
+                    print(f"Removed component {i} with area {component_area}")
+            
+            # Fill holes in the cleaned mask
+            cleaned_mask_bool = cleaned_mask > 0
+            hole_threshold = max(20, int(np.sum(cleaned_mask_bool) * 0.02))
+            final_mask_bool = remove_small_holes(cleaned_mask_bool, area_threshold=hole_threshold)
+            
+            # Light morphological closing only if needed
+            kernel_size = max(3, min(5, int(min(h, w) * 0.005)))
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            final_mask_uint8 = final_mask_bool.astype(np.uint8)
+            smoothed_mask = cv2.morphologyEx(final_mask_uint8, cv2.MORPH_CLOSE, kernel)
+            
+            removed_pixels = mask_area - np.sum(smoothed_mask)
+            print(f"YOLO cleanup removed {removed_pixels} pixels, final components: {num_labels - 1}")
+            
+            return smoothed_mask
+            
+        except Exception as e:
+            print(f"Error during YOLO-seg mask cleanup: {e}")
+            return (mask_np > 0).astype(np.uint8)
+    
+    def _select_best_yoloseg_mask(self, cleaned_masks, tight_bbox_in_crop):
+        """
+        Selects the best YOLO-seg mask using criteria specific to face segmentation.
+        Prioritizes masks that stay within face boundaries over those that extend to bbox edges.
+        """
+        try:
+            if not cleaned_masks:
+                return None
+            
+            if len(cleaned_masks) == 1:
+                return cleaned_masks[0]
+            
+            x1, y1, x2, y2 = tight_bbox_in_crop
+            bbox_width = x2 - x1
+            bbox_height = y2 - y1
+            bbox_area = bbox_width * bbox_height
+            
+            # More precise edge detection - check actual bbox boundaries
+            edge_buffer = 3  # Only check pixels very close to actual edges
+            
+            scored_masks = []
+            
+            for mask_data in cleaned_masks:
+                mask = mask_data['mask']
+                mask_area = np.sum(mask > 0)
+                
+                if mask_area == 0:
+                    continue
+                
+                # 1. Precise edge boundary analysis
+                edge_violations = 0
+                total_boundary_length = 0
+                
+                # Check if mask touches actual bbox boundaries (not just near them)
+                # Top boundary
+                top_boundary_pixels = np.sum(mask[y1:y1+edge_buffer, x1:x2] > 0)
+                top_boundary_length = x2 - x1
+                total_boundary_length += top_boundary_length
+                edge_violations += top_boundary_pixels
+                
+                # Bottom boundary  
+                bottom_boundary_pixels = np.sum(mask[max(y1, y2-edge_buffer):y2, x1:x2] > 0)
+                bottom_boundary_length = x2 - x1
+                total_boundary_length += bottom_boundary_length
+                edge_violations += bottom_boundary_pixels
+                
+                # Left boundary
+                left_boundary_pixels = np.sum(mask[y1:y2, x1:x1+edge_buffer] > 0)
+                left_boundary_length = y2 - y1
+                total_boundary_length += left_boundary_length
+                edge_violations += left_boundary_pixels
+                
+                # Right boundary
+                right_boundary_pixels = np.sum(mask[y1:y2, max(x1, x2-edge_buffer):x2] > 0)
+                right_boundary_length = y2 - y1
+                total_boundary_length += right_boundary_length
+                edge_violations += right_boundary_pixels
+                
+                # Calculate boundary violation ratio
+                boundary_violation_ratio = edge_violations / total_boundary_length if total_boundary_length > 0 else 0
+                
+                # 2. Mask spread analysis - check how much mask extends toward edges vs stays centered
+                mask_coords = np.argwhere(mask > 0)
+                if len(mask_coords) > 0:
+                    mask_y_coords, mask_x_coords = mask_coords[:, 0], mask_coords[:, 1]
+                    
+                    # Calculate how close the mask gets to each boundary
+                    min_dist_to_top = np.min(mask_y_coords - y1) if len(mask_y_coords) > 0 else bbox_height
+                    min_dist_to_bottom = np.min(y2 - mask_y_coords) if len(mask_y_coords) > 0 else bbox_height
+                    min_dist_to_left = np.min(mask_x_coords - x1) if len(mask_x_coords) > 0 else bbox_width
+                    min_dist_to_right = np.min(x2 - mask_x_coords) if len(mask_x_coords) > 0 else bbox_width
+                    
+                    # Penalty for getting too close to any boundary
+                    boundary_proximity_penalty = 0
+                    edge_threshold = 5  # pixels
+                    
+                    if min_dist_to_top < edge_threshold:
+                        boundary_proximity_penalty += (edge_threshold - min_dist_to_top) / edge_threshold * 0.25
+                    if min_dist_to_bottom < edge_threshold:
+                        boundary_proximity_penalty += (edge_threshold - min_dist_to_bottom) / edge_threshold * 0.25
+                    if min_dist_to_left < edge_threshold:
+                        boundary_proximity_penalty += (edge_threshold - min_dist_to_left) / edge_threshold * 0.25
+                    if min_dist_to_right < edge_threshold:
+                        boundary_proximity_penalty += (edge_threshold - min_dist_to_right) / edge_threshold * 0.25
+                    
+                    boundary_proximity_penalty = min(1.0, boundary_proximity_penalty)
+                else:
+                    boundary_proximity_penalty = 1.0
+                
+                # 3. Coverage analysis
+                coverage_ratio = mask_area / bbox_area
+                
+                # Prefer moderate coverage (good face masks shouldn't fill entire bbox)
+                if 0.35 <= coverage_ratio <= 0.60:
+                    coverage_score = 1.0
+                elif 0.25 <= coverage_ratio < 0.35:
+                    coverage_score = 0.7 + (coverage_ratio - 0.25) * 3
+                elif 0.60 < coverage_ratio <= 0.75:
+                    coverage_score = 1.0 - (coverage_ratio - 0.60) * 2
+                else:
+                    coverage_score = max(0.1, 1.0 - abs(coverage_ratio - 0.45) * 2)
+                
+                # 4. Shape quality
+                compactness_score = self.calculate_solidity_score(mask)
+                
+                acceptable_violation_threshold = 0.08  # 8% boundary touching is still acceptable
+                penalty_steepness = 12  # How quickly score drops for violations above threshold
+                
+                # Sigmoid function: smooth transition from 1.0 (good) to 0.0 (bad)
+                sigmoid_input = penalty_steepness * (boundary_violation_ratio - acceptable_violation_threshold)
+                boundary_score = 1.0 / (1.0 + math.exp(sigmoid_input))
+                
+                # Apply proximity penalty (but cap the total penalty)
+                boundary_score = max(0.05, boundary_score - boundary_proximity_penalty * 0.5)
+                
+                final_score = (
+                    boundary_score * 0.70 +           # Most important: stay away from boundaries
+                    coverage_score * 0.20 +           # Moderate coverage preference  
+                    compactness_score * 0.10          # Shape quality
+                )
+                
+                scored_masks.append({
+                    'mask_data': mask_data,
+                    'score': final_score,
+                    'boundary_violation_ratio': boundary_violation_ratio,
+                    'boundary_proximity_penalty': boundary_proximity_penalty,
+                    'boundary_score': boundary_score,
+                    'coverage_ratio': coverage_ratio,
+                    'coverage_score': coverage_score,
+                    'edge_details': {
+                        'top': top_boundary_pixels,
+                        'bottom': bottom_boundary_pixels, 
+                        'left': left_boundary_pixels,
+                        'right': right_boundary_pixels,
+                        'min_distances': [min_dist_to_top, min_dist_to_bottom, min_dist_to_left, min_dist_to_right]
+                    }
+                })
+                
+                print(f"Mask {mask_data['index']}: score={final_score:.3f}")
+                print(f"  Boundary violations: {boundary_violation_ratio:.3f} (T:{top_boundary_pixels}, B:{bottom_boundary_pixels}, L:{left_boundary_pixels}, R:{right_boundary_pixels})")
+                print(f"  Min distances to edges: {[min_dist_to_top, min_dist_to_bottom, min_dist_to_left, min_dist_to_right]}")
+                print(f"  Coverage: {coverage_ratio:.3f}, Boundary score: {boundary_score:.3f}, Proximity penalty: {boundary_proximity_penalty:.3f}")   
+            
+            if not scored_masks:
+                return None
+            
+            # Sort by score and return best
+            best_mask = max(scored_masks, key=lambda x: x['score'])
+            print(f"Selected YOLO-seg mask {best_mask['mask_data']['index']} with score {best_mask['score']:.3f}")
+            
+            return best_mask['mask_data']
+            
+        except Exception as e:
+            print(f"Error in YOLO-seg mask selection: {e}")
+            return cleaned_masks[0] if cleaned_masks else None
+    
+    def _process_yoloseg_results(self, results, face_data, crop_w, crop_h):
+        if not results or results[0].masks is None or len(results[0].masks.data) == 0:
+            mask_count = len(results[0].masks.data) if results and results[0].masks else 0
+            print(f"YOLO-seg found {mask_count} masks. Falling back to oval mask for this face.")
+            return None
+        
+        mask_count = len(results[0].masks.data)
+        print(f"YOLO-seg found {mask_count} mask(s) for this face.")
+        
+        if mask_count == 1:
+            # Single mask - process and cleanup
+            mask_tensor = results[0].masks.data[0].cpu()
+            resized_mask_float = cv2.resize(
+                mask_tensor.numpy().astype(np.float32),
+                (crop_w, crop_h),
+                interpolation=cv2.INTER_LINEAR
+            )
+            # Convert to binary and apply YOLO-seg specific cleanup
+            binary_mask = (resized_mask_float > 0.4).astype(np.uint8)
+            cleaned_mask = self._cleanup_yoloseg_mask(binary_mask)
+            return cleaned_mask
+        else:
+            # Multiple masks - process each one and then select best
+            cleaned_masks = []
+            
+            for i in range(mask_count):
+                mask_tensor = results[0].masks.data[i].cpu()
+                resized_mask_float = cv2.resize(
+                    mask_tensor.numpy().astype(np.float32),
+                    (crop_w, crop_h),
+                    interpolation=cv2.INTER_LINEAR
+                )
+                
+                # Convert to binary and apply cleanup
+                binary_mask = (resized_mask_float > 0.4).astype(np.uint8)
+                cleaned_mask = self._cleanup_yoloseg_mask(binary_mask)
+                
+                # Only keep masks that survived cleanup
+                if np.sum(cleaned_mask) > 50:
+                    cleaned_masks.append({
+                        'index': i,
+                        'mask': cleaned_mask,
+                        'original_index': i
+                    })
+            
+            if not cleaned_masks:
+                print("No YOLO-seg masks survived cleanup. Falling back to oval mask.")
+                return None
+            
+            if len(cleaned_masks) == 1:
+                print(f"After cleanup, only 1 mask remains from {mask_count} original masks.")
+                return cleaned_masks[0]['mask']
+            
+            # Multiple masks survived - use YOLO-specific selection
+            bbox = face_data['bbox']
+            cx1, cy1, cx2, cy2 = self.make_crop_region(bbox, self.full_image_for_sam.shape[1], self.full_image_for_sam.shape[0])
+            tight_bbox_in_crop = [bbox[0]-cx1, bbox[1]-cy1, bbox[2]-cx1, bbox[3]-cy1]
+            
+            best_mask_data = self._select_best_yoloseg_mask(cleaned_masks, tight_bbox_in_crop)
+            
+            if not best_mask_data:
+                print("YOLO-seg mask selection failed. Using first cleaned mask.")
+                return cleaned_masks[0]['mask']
+            
+            selected_mask = best_mask_data['mask']
+            print(f"Selected YOLO-seg mask {best_mask_data['index'] + 1} out of {len(cleaned_masks)} cleaned masks")
+            return selected_mask
+        
     
     def _graft_satellite_masks(self, best_mask_data, all_masks_data, crop_bbox):
         try:
@@ -447,7 +851,7 @@ class ForbiddenVisionFaceDetector:
                 if should_keep_filled:
                     major_fills_mask[labels == i] = 1
                 elif should_restore_detail:
-                    pass  # Do nothing - don't fill this component
+                    pass
                 else:
                     major_fills_mask[labels == i] = 1
 
@@ -464,6 +868,7 @@ class ForbiddenVisionFaceDetector:
         except Exception as e:
             print(f"Error during final mask recomposition: {e}")
             return processed_mask
+    
     def generate_sam_mask_for_face(self, face_data, face_index, sam_threshold, attempt_face_completion=False):
         try:
             check_for_interruption()
@@ -494,7 +899,6 @@ class ForbiddenVisionFaceDetector:
             best_base_data = self.select_best_mask(all_masks_data, crop_bbox)
 
             if not best_base_data:
-
                 self.sam_predictor.set_image(full_image, image_format='RGB')
                 return []
 
@@ -584,22 +988,19 @@ class ForbiddenVisionFaceDetector:
             bridge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_size, bridge_size))
             
             BridgedMask = cv2.morphologyEx(MergedMask, cv2.MORPH_CLOSE, bridge_kernel)
-            final_mask_crop = self._recompose_mask_with_detail_preservation(
+            intermediate_mask = self._recompose_mask_with_detail_preservation(
                 processed_mask=BridgedMask, 
                 original_mask=OriginalChosenMask, 
                 min_hole_area_threshold=min_hole_area_threshold,
                 noise_threshold=dynamic_noise_threshold
             )
+            
+            final_mask_crop = self._final_mask_cleanup(intermediate_mask)
 
             self.sam_predictor.set_image(full_image, image_format='RGB')
             full_size_mask = np.zeros((fh, fw), dtype=np.float32)
             full_size_mask[cy1:cy2, cx1:cx2] = final_mask_crop.astype(np.float32)
-            final_mask_bool = final_mask_crop > 0
-            final_mask_bool = remove_small_objects(final_mask_bool, min_size=dynamic_noise_threshold * 2)
-            final_mask_crop = final_mask_bool.astype(np.float32)
 
-            full_size_mask = np.zeros((fh, fw), dtype=np.float32)
-            full_size_mask[cy1:cy2, cx1:cx2] = final_mask_crop
             return [full_size_mask]
 
         except model_management.InterruptProcessingException:
@@ -609,65 +1010,617 @@ class ForbiddenVisionFaceDetector:
             if hasattr(self, 'full_image_for_sam'): 
                 self.sam_predictor.set_image(self.full_image_for_sam, 'RGB')
             return []
+        
+    def _final_mask_cleanup(self, mask_np):
+        """
+        Performs a final, robust, resolution-independent cleanup on a binary mask.
+        """
+        if mask_np.sum() < 10:
+            return mask_np
 
-    def detect_faces_with_sam_refinement(self, image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection, attempt_face_completion=False):
+        mask_bool = mask_np > 0
+        mask_area = np.sum(mask_bool)
+        
+        NOISE_AREA_PERCENT = 0.005
+        ABSOLUTE_MIN_NOISE_PIXELS = 25
+        
+        noise_threshold = max(ABSOLUTE_MIN_NOISE_PIXELS, int(mask_area * NOISE_AREA_PERCENT))
+        
+        cleaned_mask_bool = remove_small_objects(mask_bool, min_size=noise_threshold)
+        
+        if np.sum(cleaned_mask_bool) == 0:
+            return np.zeros_like(mask_np, dtype=np.uint8)
+        
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned_mask_bool.astype(np.uint8), 8, cv2.CV_32S)
+        
+        if num_labels > 1:
+            component_areas = stats[1:, cv2.CC_STAT_AREA]
+            largest_area = np.max(component_areas)
+            
+            MIN_RELATIVE_SIZE = 0.02
+            final_mask = np.zeros_like(cleaned_mask_bool)
+            
+            for i in range(1, num_labels):
+                component_area = stats[i, cv2.CC_STAT_AREA]
+                if component_area >= (largest_area * MIN_RELATIVE_SIZE):
+                    final_mask[labels == i] = True
+            
+            cleaned_mask_bool = final_mask
+        
+        cleaned_mask_area = np.sum(cleaned_mask_bool)
+        HOLE_AREA_PERCENT = 0.1
+        hole_threshold = int(cleaned_mask_area * HOLE_AREA_PERCENT)
+        
+        final_mask_bool = remove_small_holes(cleaned_mask_bool, area_threshold=hole_threshold)
+        
+        return final_mask_bool.astype(np.uint8)
+    def detect_faces(self, image_tensor, bbox_model_name, bbox_model_B_name, sam_model_name, sam_model_B_name, detection_confidence, sam_threshold, face_selection, attempt_face_completion=False):
+        """
+        Main face detection entry point using optimal bbox-segmentation combination search.
+        Tries all combinations to find the best results.
+        """
+        print(f"Starting optimal combination search: bbox models ({bbox_model_name}, {bbox_model_B_name}) + seg models ({sam_model_name}, {sam_model_B_name})")
+        
+        return self.detect_faces_with_optimal_combination_search(
+            image_tensor=image_tensor,
+            bbox_model_name=bbox_model_name, 
+            bbox_model_B_name=bbox_model_B_name,
+            seg_model_name=sam_model_name,
+            seg_model_B_name=sam_model_B_name, 
+            detection_confidence=detection_confidence,
+            sam_threshold=sam_threshold,
+            face_selection=face_selection,
+            attempt_face_completion=attempt_face_completion
+        )
+    def _deduplicate_bbox_candidates(self, bbox_candidates):
+        """
+        Merge overlapping bbox detections from different models.
+        Assumes overlapping bboxes (IoU > threshold) are the same face.
+        """
+        if len(bbox_candidates) <= 1:
+            return bbox_candidates
+        
+        def calculate_iou(box1, box2):
+            """Calculate Intersection over Union of two bboxes"""
+            x1_1, y1_1, x2_1, y2_1 = box1
+            x1_2, y1_2, x2_2, y2_2 = box2
+            
+            # Calculate intersection
+            x1_i = max(x1_1, x1_2)
+            y1_i = max(y1_1, y1_2)
+            x2_i = min(x2_1, x2_2)
+            y2_i = min(y2_1, y2_2)
+            
+            if x2_i <= x1_i or y2_i <= y1_i:
+                return 0.0  # No intersection
+            
+            intersection = (x2_i - x1_i) * (y2_i - y1_i)
+            area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+            area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+            union = area1 + area2 - intersection
+            
+            return intersection / union if union > 0 else 0.0
+        
+        deduplicated = []
+        used_indices = set()
+        
+        for i, candidate1 in enumerate(bbox_candidates):
+            if i in used_indices:
+                continue
+                
+            # Find all overlapping candidates
+            overlapping_group = [candidate1]
+            used_indices.add(i)
+            
+            for j, candidate2 in enumerate(bbox_candidates[i+1:], i+1):
+                if j in used_indices:
+                    continue
+                    
+                iou = calculate_iou(candidate1['bbox'], candidate2['bbox'])
+                if iou > 0.3:  # 30% overlap threshold
+                    overlapping_group.append(candidate2)
+                    used_indices.add(j)
+            
+            # Select best candidate from overlapping group (highest confidence)
+            best_candidate = max(overlapping_group, key=lambda x: x['conf'])
+            deduplicated.append(best_candidate)
+            
+            if len(overlapping_group) > 1:
+                sources = [c['source'] for c in overlapping_group]
+                print(f"Merged overlapping detections from {sources} -> kept {best_candidate['source']} (conf: {best_candidate['conf']:.3f})")
+        
+        return deduplicated
+    
+    def detect_faces_with_optimal_combination_search(self, image_tensor, bbox_model_name, bbox_model_B_name, seg_model_name, seg_model_B_name, detection_confidence, sam_threshold=0.5, face_selection=0, attempt_face_completion=False):
+        """
+        Two-phase approach:
+        Phase 1: Find face locations using confidence-based detection
+        Phase 2: Optimize bbox+segmentation combinations for each face
+        """
         try:
             check_for_interruption()
-            detected_faces = self.detect_faces_bbox_only(image_tensor, bbox_model_name, detection_confidence)
-            if not detected_faces: return []
             
-            if not self.load_sam_model(sam_model_name): 
-                print("Warning: SAM model failed to load. Falling back to BBox masks.")
-                return [face['mask'] for face in detected_faces if 'mask' in face]
+            # Phase 1: Single detection run to get both raw detections and ground truth faces
+            all_detections, ground_truth_faces = self._detect_faces_phase1(
+                image_tensor, bbox_model_name, bbox_model_B_name, detection_confidence
+            )
+            if not ground_truth_faces:
+                return []
 
+            print(f"Phase 1: Found {len(ground_truth_faces)} face(s) at locations")
+            
+            # Phase 2: Per-face bbox+segmentation optimization
+            seg_models = self._prepare_segmentation_models(seg_model_name, seg_model_B_name)
+            if not seg_models:
+                print("No segmentation models available, using oval masks.")
+                return [face['mask'] for face in ground_truth_faces[:1]]
+            
+            # Pre-process image once for all segmentation attempts
             self.full_image_for_sam = (image_tensor.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            all_final_masks = []
-            for i, face_data in enumerate(detected_faces):
-                check_for_interruption()
-                generated_masks = self.generate_sam_mask_for_face(face_data, i, sam_threshold, attempt_face_completion)
-                if generated_masks: all_final_masks.extend(generated_masks)
+            fh, fw = self.full_image_for_sam.shape[:2]
             
-            if not all_final_masks:
-                print("Warning: SAM refinement did not produce any masks. Falling back to BBox masks.")
-                return [face['mask'] for face in detected_faces if 'mask' in face]
+            final_masks = []
+            for face_idx, ground_truth_face in enumerate(ground_truth_faces):
+                print(f"Phase 2: Optimizing Face {face_idx + 1}")
+                
+                # Get all bbox options for this specific face region
+                face_bbox_options = self._get_bbox_options_for_face(
+                    ground_truth_face, all_detections
+                )
+                
+                # Test all bbox+seg combinations for this face
+                best_mask = self._optimize_face_combinations(
+                    face_bbox_options, seg_models, fh, fw, face_idx
+                )
+                
+                if best_mask is not None:
+                    final_masks.append(best_mask)
+                else:
+                    print(f"  All combinations failed, using oval mask")
+                    final_masks.append(ground_truth_face['mask'])
             
-            if face_selection == 0: return all_final_masks
-            elif face_selection <= len(all_final_masks): return [all_final_masks[face_selection - 1]]
-            else: return [all_final_masks[0]]
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e: 
-            print(f"Error in two-stage detection: {e}")
+            # Apply face selection filter
+            if face_selection == 0:
+                return final_masks
+            elif face_selection <= len(final_masks):
+                return [final_masks[face_selection - 1]]
+            else:
+                return [final_masks[0]] if final_masks else []
+                
+        except Exception as e:
+            print(f"Error in optimal combination search: {e}")
             return []
+    def _detect_faces_phase1(self, image_tensor, bbox_model_name, bbox_model_B_name, detection_confidence):
+        """
+        Single Phase 1 detection that returns both raw detections and ground truth faces.
+        Eliminates redundant model loading and inference - runs detection only once.
+        """
+        try:
+            image_uint8 = (image_tensor.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            h, w = image_uint8.shape[:2]
+            pil_image = Image.fromarray(image_uint8, mode='RGB')
+            
+            all_detections = []
+            
+            # Get detections from primary bbox model
+            if self.load_bbox_detector(bbox_model_name):
+                results = self.bbox_model(pil_image, conf=detection_confidence, verbose=False)
+                if results and results[0].boxes is not None:
+                    for box in results[0].boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        if (x2 - x1) >= 20 and (y2 - y1) >= 20:
+                            conf = box.conf[0].item()
+                            all_detections.append({
+                                'bbox': [x1, y1, x2, y2],
+                                'conf': conf,
+                                'source': bbox_model_name
+                            })
+            
+            # Get detections from secondary bbox model if specified
+            if bbox_model_B_name and bbox_model_B_name != "None":
+                if self.load_bbox_detector_B(bbox_model_B_name):
+                    results = self.bbox_model_B(pil_image, conf=detection_confidence, verbose=False)
+                    if results and results[0].boxes is not None:
+                        for box in results[0].boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            if (x2 - x1) >= 20 and (y2 - y1) >= 20:
+                                conf = box.conf[0].item()
+                                all_detections.append({
+                                    'bbox': [x1, y1, x2, y2],
+                                    'conf': conf,
+                                    'source': bbox_model_B_name
+                                })
+            
+            print(f"Phase 1 raw detections: {len(all_detections)} total")
+            for det in all_detections:
+                print(f"  {det['source']}: conf={det['conf']:.3f}")
+            
+            # Deduplicate to get ground truth faces
+            unique_faces = self._deduplicate_bbox_candidates(all_detections)
+            
+            # Convert to ground truth faces with oval masks
+            ground_truth_faces = []
+            for face in unique_faces:
+                oval_mask = self._create_oval_mask(face['bbox'], h, w)
+                ground_truth_faces.append({
+                    'bbox': face['bbox'],
+                    'mask': oval_mask,
+                    'conf': face['conf'],
+                    'source': face['source']
+                })
+                print(f"  Ground truth face: {face['source']} (conf: {face['conf']:.3f})")
+            
+            return all_detections, ground_truth_faces
+            
+        except Exception as e:
+            print(f"Error in Phase 1 face detection: {e}")
+            return [], []
+    def _get_bbox_options_for_face(self, ground_truth_face, all_phase1_detections):
+        """
+        Phase 2: Get bbox options by finding which Phase 1 detections overlap with this face.
+        Reuses detections from Phase 1 instead of re-running detection.
+        """
+        try:
+            gt_bbox = ground_truth_face['bbox']
+            bbox_options = []
+            
+            def calculate_iou(box1, box2):
+                x1_1, y1_1, x2_1, y2_1 = box1
+                x1_2, y1_2, x2_2, y2_2 = box2
+                
+                x1_i = max(x1_1, x1_2)
+                y1_i = max(y1_1, y1_2)
+                x2_i = min(x2_1, x2_2)
+                y2_i = min(y2_1, y2_2)
+                
+                if x2_i <= x1_i or y2_i <= y1_i:
+                    return 0.0
+                
+                intersection = (x2_i - x1_i) * (y2_i - y1_i)
+                area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+                area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+                union = area1 + area2 - intersection
+                
+                return intersection / union if union > 0 else 0.0
+            
+            # Find all Phase 1 detections that overlap with this ground truth face
+            for detection in all_phase1_detections:
+                iou = calculate_iou(gt_bbox, detection['bbox'])
+                
+                # Include if it overlaps significantly with this face
+                if iou > 0.1:  # Lower threshold to capture variations
+                    bbox_options.append({
+                        'bbox': detection['bbox'],
+                        'conf': detection['conf'],
+                        'source': detection['source'],
+                        'iou_with_gt': iou
+                    })
+            
+            # Remove exact duplicates
+            unique_bbox_options = []
+            for option in bbox_options:
+                is_duplicate = False
+                for existing in unique_bbox_options:
+                    if (option['bbox'] == existing['bbox'] and 
+                        option['source'] == existing['source']):
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    unique_bbox_options.append(option)
+            
+            print(f"  Found {len(unique_bbox_options)} bbox options for this face")
+            for opt in unique_bbox_options:
+                print(f"    {opt['source']} (conf: {opt['conf']:.3f}, IoU: {opt.get('iou_with_gt', 0):.3f})")
+            
+            return unique_bbox_options
+            
+        except Exception as e:
+            print(f"Error getting bbox options for face: {e}")
+            return [{'bbox': ground_truth_face['bbox'], 'conf': ground_truth_face['conf'], 'source': 'fallback'}]
+    def _optimize_face_combinations(self, bbox_options, seg_models, fh, fw, face_idx):
+        """
+        Phase 2: Test all bbox+segmentation combinations for a specific face.
+        Returns the best mask for this face.
+        """
+        try:
+            all_combinations = []
+            
+            for bbox_option in bbox_options:
+                bbox = bbox_option['bbox']
+                oval_mask = self._create_oval_mask(bbox, fh, fw)
+                
+                face_data = {
+                    'bbox': bbox,
+                    'mask': oval_mask
+                }
+                
+                for seg_model in seg_models:
+                    try:
+                        check_for_interruption()
+                        
+                        # Load appropriate segmentation model
+                        seg_loaded = False
+                        if seg_model['type'] == 'yoloseg':
+                            seg_loaded = self.load_yoloseg_model(seg_model['name'])
+                        elif seg_model['type'] == 'sam':
+                            seg_loaded = self.load_sam_model(seg_model['name'])
+                        
+                        if not seg_loaded:
+                            print(f"    Failed to load {seg_model['name']}")
+                            continue
+                        
+                        # Generate mask using appropriate method
+                        generated_masks = []
+                        if seg_model['type'] == 'yoloseg':
+                            mask_crop = self._generate_single_yoloseg_mask(face_data, fh, fw)
+                            if mask_crop is not None:
+                                full_mask = np.zeros((fh, fw), dtype=np.float32)
+                                cx1, cy1, cx2, cy2 = self.make_crop_region(bbox, fw, fh)
+                                full_mask[cy1:cy2, cx1:cx2] = mask_crop.astype(np.float32)
+                                generated_masks = [full_mask]
+                            else:
+                                # Fallback to oval mask when YOLO-seg fails
+                                print(f"    YOLO-seg failed, using oval mask for scoring")
+                                generated_masks = [face_data['mask']]
+                                
+                        elif seg_model['type'] == 'sam':
+                            generated_masks = self.generate_sam_mask_for_face(face_data, face_idx, 0.5, False)
+                        
+                        # Score successful masks
+                        for mask in generated_masks:
+                            if np.sum(mask) > 50:  # Minimum viable mask
+                                # Use the actual bbox that was used for this mask generation
+                                quality_score = self._calculate_mask_quality_score(mask, bbox)
+                                
+                                # Remove bbox confidence bonus entirely - let quality dominate
+                                final_score = quality_score
+                                
+                                all_combinations.append({
+                                    'mask': mask,
+                                    'bbox_source': bbox_option['source'],
+                                    'seg_source': seg_model['name'],
+                                    'seg_type': seg_model['type'],
+                                    'quality_score': quality_score,
+                                    'final_score': final_score,
+                                    'bbox_conf': bbox_option['conf']
+                                })
+                                
+                                print(f"    {bbox_option['source']} + {seg_model['name']}: quality={quality_score:.3f}, final={final_score:.3f}")
+                    
+                    except Exception as e:
+                        print(f"    Error testing {bbox_option['source']} + {seg_model['name']}: {e}")
+                        continue
+            
+            # Select best combination
+            if not all_combinations:
+                return None
+            
+            best_combo = max(all_combinations, key=lambda x: x['final_score'])
+            print(f"  Selected: {best_combo['bbox_source']} + {best_combo['seg_source']} (final score: {best_combo['final_score']:.3f})")
+            
+            return best_combo['mask']
+            
+        except Exception as e:
+            print(f"Error optimizing face combinations: {e}")
+            return None
+    
 
-    def detect_faces(self, image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection, attempt_face_completion=False):
-        if sam_model_name and sam_model_name != "None Found":
-            return self.detect_faces_with_sam_refinement(image_tensor, bbox_model_name, sam_model_name, detection_confidence, sam_threshold, face_selection, attempt_face_completion)
-        else:
-            detected_segments = self.detect_faces_bbox_only(image_tensor, bbox_model_name, detection_confidence)
-            masks = [seg['mask'] for seg in detected_segments if 'mask' in seg]
-            if not masks: return []
-            if face_selection == 0: return masks
-            elif face_selection <= len(masks): return [masks[face_selection-1]]
-            else: return [masks[0]]
-    def detect_faces_bbox_only(self, image_tensor, bbox_model_name, detection_confidence):
+    def _generate_single_yoloseg_mask(self, face_data, fh, fw):
+        """
+        Generate single YOLO-seg mask for face. DRY helper that reuses existing logic.
+        """
+        try:
+            bbox = face_data['bbox']
+            cx1, cy1, cx2, cy2 = self.make_crop_region(bbox, fw, fh)
+            crop_img = self.full_image_for_sam[cy1:cy2, cx1:cx2]
+            crop_h, crop_w = crop_img.shape[:2]
+
+            results = self.yoloseg_model(crop_img, conf=0.25, verbose=False)
+            mask_crop = self._process_yoloseg_results(results, face_data, crop_w, crop_h)
+            
+            return mask_crop
+            
+        except Exception as e:
+            print(f"Error generating YOLO-seg mask: {e}")
+            return None
+
+    def _calculate_mask_quality_score(self, mask, bbox_used_for_generation):
+        """
+        Calculate quality score using the actual bbox that was used for mask generation.
+        """
+        try:
+            if np.sum(mask) == 0:
+                return 0.0
+            
+            x1, y1, x2, y2 = bbox_used_for_generation
+            bbox_area = (x2 - x1) * (y2 - y1)
+            
+            # Extract the relevant mask region that corresponds to this bbox
+            h, w = mask.shape
+            cx1, cy1, cx2, cy2 = self.make_crop_region(bbox_used_for_generation, w, h)
+            
+            # Get mask crop for analysis
+            if cy2 > cy1 and cx2 > cx1 and cy1 >= 0 and cx1 >= 0 and cy2 <= h and cx2 <= w:
+                mask_crop = mask[cy1:cy2, cx1:cx2]
+                tight_bbox_in_crop = [
+                    max(0, x1-cx1), max(0, y1-cy1), 
+                    min(cx2-cx1, x2-cx1), min(cy2-cy1, y2-cy1)
+                ]
+            else:
+                print(f"      Invalid crop region, using full mask")
+                mask_crop = mask
+                tight_bbox_in_crop = [0, 0, w, h]
+            
+            # 1. Coverage score (most important)
+            mask_area_in_bbox = np.sum(mask_crop > 0)
+            tight_bbox_area = (tight_bbox_in_crop[2] - tight_bbox_in_crop[0]) * (tight_bbox_in_crop[3] - tight_bbox_in_crop[1])
+            coverage_ratio = mask_area_in_bbox / tight_bbox_area if tight_bbox_area > 0 else 0
+            
+            # Optimal coverage: 35-70%, heavily penalize tiny masks
+            if 0.35 <= coverage_ratio <= 0.70:
+                coverage_score = 1.0
+            elif 0.20 <= coverage_ratio < 0.35:
+                coverage_score = 0.2 + (coverage_ratio - 0.20) * 5.33  # Scale from 0.2 to 1.0
+            elif 0.70 < coverage_ratio <= 0.85:
+                coverage_score = 1.0 - (coverage_ratio - 0.70) * 1.33  # Scale from 1.0 to 0.8
+            else:
+                # Heavily penalize tiny or massive masks
+                coverage_score = max(0.05, 0.2 - abs(coverage_ratio - 0.525) * 1.5)
+            
+            # 2. Boundary analysis (moderate importance)
+            tx1, ty1, tx2, ty2 = tight_bbox_in_crop
+            edge_buffer = 3
+            boundary_violations = 0
+            total_boundary_pixels = 0
+            
+            # Check actual boundary violations
+            if ty1 + edge_buffer <= ty2 and tx1 < tx2:
+                boundary_violations += np.sum(mask_crop[ty1:min(ty1+edge_buffer, ty2), tx1:tx2] > 0)
+                total_boundary_pixels += (min(ty1+edge_buffer, ty2) - ty1) * (tx2 - tx1)
+            
+            if ty2 - edge_buffer >= ty1 and tx1 < tx2:
+                boundary_violations += np.sum(mask_crop[max(ty1, ty2-edge_buffer):ty2, tx1:tx2] > 0)
+                total_boundary_pixels += (ty2 - max(ty1, ty2-edge_buffer)) * (tx2 - tx1)
+            
+            if tx1 + edge_buffer <= tx2 and ty1 < ty2:
+                boundary_violations += np.sum(mask_crop[ty1:ty2, tx1:min(tx1+edge_buffer, tx2)] > 0)
+                total_boundary_pixels += (ty2 - ty1) * (min(tx1+edge_buffer, tx2) - tx1)
+            
+            if tx2 - edge_buffer >= tx1 and ty1 < ty2:
+                boundary_violations += np.sum(mask_crop[ty1:ty2, max(tx1, tx2-edge_buffer):tx2] > 0)
+                total_boundary_pixels += (ty2 - ty1) * (tx2 - max(tx1, tx2-edge_buffer))
+            
+            boundary_violation_ratio = boundary_violations / total_boundary_pixels if total_boundary_pixels > 0 else 0
+            
+            # Boundary score: penalize heavy violations but allow some edge touching
+            if boundary_violation_ratio <= 0.15:
+                boundary_score = 1.0
+            elif boundary_violation_ratio <= 0.35:
+                boundary_score = 1.0 - (boundary_violation_ratio - 0.15) * 2.5  # Scale from 1.0 to 0.5
+            else:
+                boundary_score = max(0.1, 0.5 - (boundary_violation_ratio - 0.35) * 1.5)
+            
+            # 3. Shape quality (minor importance)
+            compactness_score = self.calculate_solidity_score(mask_crop)
+            
+            # Final score: Coverage 70%, Boundary 20%, Shape 10%
+            final_score = (coverage_score * 0.70 + boundary_score * 0.20 + compactness_score * 0.10)
+            
+            print(f"      Coverage: {coverage_ratio:.3f} → {coverage_score:.3f}")
+            print(f"      Boundary violations: {boundary_violation_ratio:.3f} → {boundary_score:.3f}")
+            print(f"      Shape: {compactness_score:.3f}")
+            print(f"      Final quality: {final_score:.3f}")
+            
+            return max(0.0, min(1.0, final_score))
+            
+        except Exception as e:
+            print(f"Error calculating mask quality: {e}")
+            return 0.5
+
+    def _create_oval_mask(self, bbox, h, w):
+        """
+        Create oval mask for given bbox. DRY helper function.
+        """
+        x1, y1, x2, y2 = bbox
+        oval_mask = np.zeros((h, w), dtype=np.float32)
+        center = ((x1 + x2) // 2, (y1 + y2) // 2)
+        axes = ((x2 - x1) // 2, (y2 - y1) // 2)
+        cv2.ellipse(oval_mask, center, axes, 0, 0, 360, 1.0, -1)
+        return oval_mask
+
+    def _prepare_segmentation_models(self, seg_model_name, seg_model_B_name):
+        """
+        Prepare list of segmentation models to try.
+        """
+        seg_models = []
+        
+        # Add primary segmentation model
+        if seg_model_name and not seg_model_name.endswith('None'):
+            seg_models.append({
+                'name': seg_model_name,
+                'type': 'sam' if seg_model_name.endswith('.pth') else 'yoloseg',
+                'is_primary': True
+            })
+        
+        # Add secondary segmentation model
+        if seg_model_B_name and seg_model_B_name != "None" and seg_model_B_name != seg_model_name:
+            seg_models.append({
+                'name': seg_model_B_name,
+                'type': 'sam' if seg_model_B_name.endswith('.pth') else 'yoloseg',
+                'is_primary': False
+            })
+        
+        return seg_models
+
+    def detect_faces_bbox_only(self, image_tensor, bbox_model_name, bbox_model_B_name, detection_confidence):
         try:
             check_for_interruption()
-            if not self.load_bbox_detector(bbox_model_name): return []
             image_uint8 = (image_tensor.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            from PIL import Image
             h, w = image_uint8.shape[:2]
-            results = self.bbox_model(Image.fromarray(image_uint8, mode='RGB'), conf=detection_confidence, verbose=False)
-            if not results or results[0].boxes is None: return []
-            
-            detected_segments = []
-            for box in results[0].boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                if (x2 - x1) < 20 or (y2 - y1) < 20: continue
-                rect_mask = np.zeros((h, w), dtype=np.float32); rect_mask[y1:y2, x1:x2] = 1.0
-                detected_segments.append({'bbox': [x1, y1, x2, y2], 'mask': rect_mask})
-            
-            return detected_segments
+            pil_image = Image.fromarray(image_uint8, mode='RGB')
+
+            if bbox_model_B_name is None or bbox_model_B_name == "None":
+                if not self.load_bbox_detector(bbox_model_name): return []
+                results = self.bbox_model(pil_image, conf=detection_confidence, verbose=False)
+                if not results or results[0].boxes is None: return []
+                
+                detected_segments = []
+                for box in results[0].boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    if (x2 - x1) < 20 or (y2 - y1) < 20: continue
+                    
+                    oval_mask = np.zeros((h, w), dtype=np.float32)
+                    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    axes = ((x2 - x1) // 2, (y2 - y1) // 2)
+                    cv2.ellipse(oval_mask, center, axes, 0, 0, 360, 1.0, -1)
+                    detected_segments.append({'bbox': [x1, y1, x2, y2], 'mask': oval_mask})
+
+                return detected_segments
+
+            else:
+                if not self.load_bbox_detector(bbox_model_name): return []
+                if not self.load_bbox_detector_B(bbox_model_B_name): return []
+
+                results_A = self.bbox_model(pil_image, conf=detection_confidence, verbose=False)
+                results_B = self.bbox_model_B(pil_image, conf=detection_confidence, verbose=False)
+                
+                print(f"DEBUG: Model A found {len(results_A[0].boxes) if results_A and results_A[0].boxes else 0} boxes")
+                print(f"DEBUG: Model B found {len(results_B[0].boxes) if results_B and results_B[0].boxes else 0} boxes")
+                
+                detected_segments = []
+
+                model_A_segments = []
+                if results_A and results_A[0].boxes is not None:
+                    for box in results_A[0].boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        if (x2 - x1) >= 20 and (y2 - y1) >= 20:
+                            conf = box.conf[0].item()
+                            oval_mask = np.zeros((h, w), dtype=np.float32)
+                            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                            axes = ((x2 - x1) // 2, (y2 - y1) // 2)
+                            cv2.ellipse(oval_mask, center, axes, 0, 0, 360, 1.0, -1)
+                            model_A_segments.append({'bbox': [x1, y1, x2, y2], 'mask': oval_mask, 'conf': conf, 'source': 'A'})
+
+                model_B_segments = []
+                if results_B and results_B[0].boxes is not None:
+                    for box in results_B[0].boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        if (x2 - x1) >= 20 and (y2 - y1) >= 20:
+                            conf = box.conf[0].item()
+                            oval_mask = np.zeros((h, w), dtype=np.float32)
+                            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                            axes = ((x2 - x1) // 2, (y2 - y1) // 2)
+                            cv2.ellipse(oval_mask, center, axes, 0, 0, 360, 1.0, -1)
+                            model_B_segments.append({'bbox': [x1, y1, x2, y2], 'mask': oval_mask, 'conf': conf, 'source': 'B'})
+
+                all_segments = model_A_segments + model_B_segments
+                if all_segments:
+                    best_segment = max(all_segments, key=lambda x: x['conf'])
+                    detected_segments = [{'bbox': best_segment['bbox'], 'mask': best_segment['mask']}]
+                    print(f"Face Detection: Selected best detection from Model {best_segment['source']} (conf: {best_segment['conf']:.3f})")
+
+                return detected_segments
+
         except Exception as e: 
             print(f"Error in BBOX detection: {e}")
             return []

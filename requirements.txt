@@ -3,5 +3,10 @@ ultralytics
 opencv-python-headless
 numpy
 scikit-image
+scikit-learn
 kornia
 transparent-background
+timm
+Pillow
+opensimplex
+ensemble-boxes

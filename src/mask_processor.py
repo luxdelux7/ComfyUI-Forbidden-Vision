@@ -55,6 +55,12 @@ class ForbiddenVisionMaskProcessor:
         try:
             check_for_interruption()
             
+            is_adaptive = isinstance(processing_resolution, tuple)
+            if is_adaptive:
+                target_wh = processing_resolution
+            else:
+                target_wh = (processing_resolution, processing_resolution)
+
             if image_tensor.device != torch.device('cpu'):
                 image_tensor = image_tensor.cpu()
             if mask_tensor.device != torch.device('cpu'):
@@ -79,7 +85,7 @@ class ForbiddenVisionMaskProcessor:
             initial_coords = np.where(mask_float > 0.5)
             if len(initial_coords[0]) == 0:
                 print("Warning: Input mask is empty. Cannot process.")
-                return self.create_empty_outputs(image_tensor, processing_resolution)
+                return self.create_empty_outputs(image_tensor, target_wh)
 
             y1, y2 = initial_coords[0].min(), initial_coords[0].max()
             x1, x2 = initial_coords[1].min(), initial_coords[1].max()
@@ -95,46 +101,80 @@ class ForbiddenVisionMaskProcessor:
             final_coords = np.where(blend_mask > 0.5)
             if len(final_coords[0]) == 0:
                 print("Warning: Mask became empty after processing. Cannot continue.")
-                return self.create_empty_outputs(image_tensor, processing_resolution)
+                return self.create_empty_outputs(image_tensor, target_wh)
 
             m_y1, m_y2 = final_coords[0].min(), final_coords[0].max()
             m_x1, m_x2 = final_coords[1].min(), final_coords[1].max()
-
             center_x, center_y = (m_x1 + m_x2) / 2, (m_y1 + m_y2) / 2
-            width, height = m_x2 - m_x1, m_y2 - m_y1
-
-            base_size = max(width, height)
-            padded_size = int(base_size * crop_padding)
-            final_crop_size = min(padded_size, w, h)
-
-            ideal_x1 = int(center_x - final_crop_size / 2)
-            ideal_y1 = int(center_y - final_crop_size / 2)
             
-            crop_x1 = max(0, min(ideal_x1, w - final_crop_size))
-            crop_y1 = max(0, min(ideal_y1, h - final_crop_size))
-            crop_x2 = crop_x1 + final_crop_size
-            crop_y2 = crop_y1 + final_crop_size
+            # --- START: SEPARATED CROPPING LOGIC ---
+            if is_adaptive:
+                # --- NEW: Aspect-Ratio-Aware Cropping Logic (ADAPTIVE MODE) ---
+                mask_w, mask_h = m_x2 - m_x1, m_y2 - m_y1
+                target_aspect_ratio = target_wh[0] / target_wh[1]
+                
+                padded_w = mask_w * crop_padding
+                padded_h = mask_h * crop_padding
+                
+                current_aspect_ratio = padded_w / padded_h
+                if current_aspect_ratio > target_aspect_ratio:
+                    final_crop_w = padded_w
+                    final_crop_h = padded_w / target_aspect_ratio
+                else:
+                    final_crop_h = padded_h
+                    final_crop_w = padded_h * target_aspect_ratio
+
+                if final_crop_w > w:
+                    scale_factor = w / final_crop_w
+                    final_crop_w *= scale_factor
+                    final_crop_h *= scale_factor
+                if final_crop_h > h:
+                    scale_factor = h / final_crop_h
+                    final_crop_w *= scale_factor
+                    final_crop_h *= scale_factor
+
+                crop_x1 = int(center_x - final_crop_w / 2)
+                crop_y1 = int(center_y - final_crop_h / 2)
+            
+            else:
+                # --- OLD: Simple Square Cropping Logic (FIXED MODE) ---
+                width, height = m_x2 - m_x1, m_y2 - m_y1
+                base_size = max(width, height)
+                padded_size = int(base_size * crop_padding)
+                final_crop_w = min(padded_size, w, h)
+                final_crop_h = final_crop_w
+
+                crop_x1 = int(center_x - final_crop_w / 2)
+                crop_y1 = int(center_y - final_crop_h / 2)
+
+            # Clamp coordinates to the image boundaries to prevent errors
+            crop_x1 = max(0, min(crop_x1, w - int(final_crop_w)))
+            crop_y1 = max(0, min(crop_y1, h - int(final_crop_h)))
+            crop_x2 = crop_x1 + int(final_crop_w)
+            crop_y2 = crop_y1 + int(final_crop_h)
+            # --- END: SEPARATED CROPPING LOGIC ---
             
             cropped_image = image_uint8[crop_y1:crop_y2, crop_x1:crop_x2]
             cropped_sampler_mask = blend_mask[crop_y1:crop_y2, crop_x1:crop_x2]
-
+            
             should_upscale = (enable_pre_upscale and 
                             upscaler_model_name and 
                             upscaler_model_name != "None Found" and
                             upscaler_loader_callback and 
                             upscaler_run_callback and
-                            final_crop_size < processing_resolution * 0.70)
+                            max(cropped_image.shape) < max(target_wh) * 0.70)
 
             if should_upscale:
                 if upscaler_loader_callback(upscaler_model_name):
                     upscaled_image = upscaler_run_callback(cropped_image)
-                    cropped_image_resized = cv2.resize(upscaled_image, (processing_resolution, processing_resolution), interpolation=cv2.INTER_LANCZOS4)
+                    cropped_image_resized = cv2.resize(upscaled_image, target_wh, interpolation=cv2.INTER_LANCZOS4)
                 else:
                     print(f"Failed to load upscaler model {upscaler_model_name}, using standard resize")
-                    cropped_image_resized = cv2.resize(cropped_image, (processing_resolution, processing_resolution), interpolation=cv2.INTER_LANCZOS4)
+                    cropped_image_resized = cv2.resize(cropped_image, target_wh, interpolation=cv2.INTER_LANCZOS4)
             else:
-                cropped_image_resized = cv2.resize(cropped_image, (processing_resolution, processing_resolution), interpolation=cv2.INTER_LANCZOS4)
-            sampler_mask_resized = cv2.resize(cropped_sampler_mask, (processing_resolution, processing_resolution), interpolation=cv2.INTER_LINEAR)
+                cropped_image_resized = cv2.resize(cropped_image, target_wh, interpolation=cv2.INTER_LANCZOS4)
+            
+            sampler_mask_resized = cv2.resize(cropped_sampler_mask, target_wh, interpolation=cv2.INTER_LINEAR)
 
             cropped_face_tensor = torch.from_numpy((cropped_image_resized / 255.0).astype(np.float32)).unsqueeze(0)
             sampler_mask_tensor = torch.from_numpy(sampler_mask_resized).unsqueeze(0)
@@ -144,8 +184,8 @@ class ForbiddenVisionMaskProcessor:
                 "original_image_size": (h, w), 
                 "crop_coords": (crop_x1, crop_y1, crop_x2, crop_y2), 
                 "face_bbox": mask_bbox,
-                "target_size": processing_resolution, 
-                "original_crop_size": (final_crop_size, final_crop_size), 
+                "target_size": target_wh,
+                "original_crop_size": (crop_x2 - crop_x1, crop_y2 - crop_y1),
                 "blend_mask": blend_mask,
                 "detection_angle": 0
             }
@@ -156,17 +196,29 @@ class ForbiddenVisionMaskProcessor:
             raise
         except Exception as e:
             print(f"Error during mask processing and cropping: {e}")
-            return self.create_empty_outputs(image_tensor, processing_resolution)
+            if isinstance(processing_resolution, int):
+                target_wh = (processing_resolution, processing_resolution)
+            else:
+                target_wh = processing_resolution
+            return self.create_empty_outputs(image_tensor, target_wh)
 
     def create_empty_outputs(self, image_tensor, target_size):
-        empty_face = torch.zeros((1, target_size, target_size, 3), dtype=torch.float32)
-        empty_mask = torch.zeros((1, target_size, target_size), dtype=torch.float32)
+        # NEW: Handle both tuple (adaptive) and int (fixed) resolution inputs
+        if isinstance(target_size, int):
+            target_wh = (target_size, target_size)
+        else:
+            target_wh = target_size # This is now a (width, height) tuple
+
+        # NEW: Create tensors with correct (h, w) dimensions from the tuple
+        empty_face = torch.zeros((1, target_wh[1], target_wh[0], 3), dtype=torch.float32)
+        empty_mask = torch.zeros((1, target_wh[1], target_wh[0]), dtype=torch.float32)
+        
         empty_info = {
-            "original_image": image_tensor.cpu().numpy() if image_tensor is not None else np.zeros((target_size, target_size, 3)),
+            "original_image": image_tensor.cpu().numpy() if image_tensor is not None else np.zeros((target_wh[1], target_wh[0], 3)),
             "original_image_size": (0, 0), "crop_coords": (0, 0, 0, 0),
-            "face_bbox": (0, 0, 0, 0), "target_size": target_size,
+            "face_bbox": (0, 0, 0, 0), "target_size": target_wh,
             "original_crop_size": (0, 0), 
-            "blend_mask": np.zeros((target_size, target_size), dtype=np.float32),
+            "blend_mask": np.zeros((target_wh[1], target_wh[0]), dtype=np.float32),
             "detection_angle": 0
         }
         return (empty_face, empty_mask, empty_info)

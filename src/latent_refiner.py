@@ -6,16 +6,50 @@ import comfy.model_management as model_management
 import comfy.utils
 import nodes
 import kornia
+import os
+import sys
+import cv2
+import urllib.request
 from PIL import Image
+from . import mood_presets
 from .utils import check_for_interruption, get_ordered_upscaler_model_list
+
 try:
     from transparent_background import Remover
 except ImportError:
+    Remover = None
+
+try:
+    from skimage import exposure
+    from skimage.color import rgb2lab, lab2rgb
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    SKIMAGE_AVAILABLE = False
+
+try:
+    from sklearn.cluster import KMeans
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+try:
+    from scipy import ndimage
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+try:
+    from .depth_anything_v2.dpt import DepthAnythingV2
+    DEPTH_ANYTHING_AVAILABLE = True
+except ImportError:
+    DEPTH_ANYTHING_AVAILABLE = False
+
+if Remover is None:
     print("-------------------------------------------------------------------------------------------------")
     print("WARNING: transparent-background library not found.")
-    print("Please install it by adding 'transparent-background' to your requirements.txt and running the update script.")
-    print("The Depth of Field (DOF) effect will not be available until this is installed.")
-    print("-------------------------------------------------------------------------------------------------")
+    print("Please install it running requirements.txt")
+    print("-------------------------------------------------------------------------------------------------")   
+
 class LatentRefiner:
     @classmethod
     def INPUT_TYPES(s):
@@ -26,24 +60,23 @@ class LatentRefiner:
 
         return {
             "required": {
-                "operating_mode": (["General", "Anime"],),
 
-                "enable_upscale": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),
+                "enable_upscale": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
                 "upscale_model": (upscaler_models, ),
                 "upscale_factor": ("FLOAT", {"default": 1.2, "min": 1.0, "max": 8.0, "step": 0.05}),
                 
+                "enable_auto_tone": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "label": "Enable Auto Tone Correction"}),
+
                 "enable_dof_effect": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
                 "dof_blur_strength": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.5}),
                 
                 "relighting_mode": (["Disabled", "Additive (Simple)", "Corrective"],),
                 "relight_strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "mood_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "mood_background_replace": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
+                "mood_preset": (list(mood_presets.PRESETS.keys()), ), 
+                "mood_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
 
-                "enable_dynamic_contrast": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),
-                "contrast_strength": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 5.0, "step": 0.1}),
                 
-                "enable_vibrance": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),
+                "enable_vibrance": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
                 "vibrance_strength": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05}),
                 
                 "enable_clarity": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
@@ -54,8 +87,7 @@ class LatentRefiner:
                 
                 "use_tiled_vae": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
                 "tile_size": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64}),
-                "enable_latent_refinement": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),
-                "latent_refinement_strength": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                
             },
             "optional": {
                 "latent": ("LATENT",),
@@ -74,7 +106,164 @@ class LatentRefiner:
         self.upscaler_model = None
         self.upscaler_model_name = None
         self.remover = None
+        self.depth_model = None
+        self.depth_transform = None
+        
+        self.cached_input_tensor = None
+        self.cached_subject_mask = None
+        self.cached_depth_map = None
+   
+    def _run_and_cache_analysis(self, image_tensor, run_segmentation, run_depth):
+     
+        try:
+            check_for_interruption()
+            h, w = image_tensor.shape[1], image_tensor.shape[2]
+            device = image_tensor.device
+            
+            self.cached_subject_mask = None
+            self.cached_depth_map = None
+            
+            img_np_uint8 = None
+            
+            if run_segmentation:
 
+                if self.remover is None:
+                    if Remover is not None:
+                        try:
+                            self.remover = Remover(mode='base', jit=False)
+                        except Exception as e:
+                            print(f"Failed to initialize transparent-background remover: {e}. Segmentation skipped.")
+                            run_segmentation = False
+                    else:
+                        print("transparent-background library not available. Segmentation skipped.")
+                        run_segmentation = False
+
+                if run_segmentation:
+                    img_np_uint8 = (image_tensor[0].cpu().numpy() * 255).astype(np.uint8)
+                    pil_image = Image.fromarray(img_np_uint8)
+                    mask_pil = self.remover.process(pil_image, type='map').convert('L')
+                    mask_np = np.array(mask_pil).astype(np.float32) / 255.0
+                    self.cached_subject_mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
+
+            check_for_interruption()
+
+            if run_depth:
+            
+                depth_model, depth_transform = self.load_depth_model()
+                if depth_model and depth_transform:
+                    if img_np_uint8 is None:
+                        img_np_uint8 = (image_tensor[0].cpu().numpy() * 255).astype(np.uint8)
+                    
+                    try:
+                        depth_np = depth_transform(img_np_uint8)
+                        
+                        if isinstance(depth_np, np.ndarray) and depth_np.ndim == 2:
+                            depth_tensor = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0).to(device).float()
+                            
+                            depth_tensor_resized = F.interpolate(
+                                depth_tensor, size=(h, w), mode="bilinear", align_corners=False
+                            )
+                            
+                            min_val = torch.min(depth_tensor_resized)
+                            max_val = torch.max(depth_tensor_resized)
+                            if max_val > min_val:
+                                self.cached_depth_map = (depth_tensor_resized - min_val) / (max_val - min_val)
+                            else:
+                                self.cached_depth_map = torch.zeros_like(depth_tensor_resized)
+
+                        else:
+                            print(f"Warning: Unexpected depth output format: {type(depth_np)}, shape: {depth_np.shape if hasattr(depth_np, 'shape') else 'unknown'}")
+                            
+                    except Exception as e:
+                        print(f"Warning: Depth estimation failed: {e}")
+ 
+                else:
+                    print("Refiner: Depth model not available, skipping depth estimation.")
+            
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            print(f"FATAL: An error occurred during AI analysis: {e}")
+            self.cached_input_tensor = None
+
+    def load_depth_model(self):
+
+        model_name_to_check = "depth_anything_v2_vits"
+        
+        if self.depth_model is not None and self.depth_transform is not None:
+            if hasattr(self.depth_model, "name_of_model_for_refiner") and self.depth_model.name_of_model_for_refiner == model_name_to_check:
+                return self.depth_model, self.depth_transform
+            else:
+                self.depth_model = None
+                self.depth_transform = None
+                print(f"Refiner: Switching to {model_name_to_check}.")
+        
+        try:
+            device = model_management.get_torch_device()
+            
+            if not DEPTH_ANYTHING_AVAILABLE:
+                print("FATAL: Depth Anything V2 module not available")
+                self.depth_model = None
+                self.depth_transform = None
+                return None, None
+
+            model_config = {
+                'encoder': 'vits', 
+                'features': 64, 
+                'out_channels': [48, 96, 192, 384]
+            }
+            
+            model = DepthAnythingV2(**model_config)
+            
+            model_dir = os.path.join(folder_paths.models_dir, "depth_anything_v2")
+            model_path = os.path.join(model_dir, "depth_anything_v2_vits.pth")
+            
+            if not os.path.exists(model_path):
+                print(f"Refiner: Downloading Depth Anything V2 Small weights to '{model_path}'...")
+                os.makedirs(model_dir, exist_ok=True)
+                url = "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth"
+                urllib.request.urlretrieve(url, model_path)
+                print(f"Refiner: Download complete.")
+            
+            state_dict = torch.load(model_path, map_location='cpu')
+            model.load_state_dict(state_dict)
+            model = model.to(device).eval()
+            
+            def transform_and_predict(img_np_rgb):
+                try:
+                    check_for_interruption()
+                    
+                    if img_np_rgb.dtype != np.uint8:
+                        img_np_rgb = (img_np_rgb * 255).astype(np.uint8)
+                    
+                    img_bgr = cv2.cvtColor(img_np_rgb, cv2.COLOR_RGB2BGR)
+                    
+                    depth = model.infer_image(img_bgr)
+                    
+                    depth_normalized = (depth - depth.min()) / (depth.max() - depth.min())
+                    
+                    return depth_normalized
+                    
+                except model_management.InterruptProcessingException:
+                    raise
+                except Exception as e:
+                    print(f"Error in Depth Anything V2 prediction: {e}")
+                    return np.zeros_like(img_np_rgb[:,:,0])
+            
+            self.depth_model = model
+            self.depth_model.name_of_model_for_refiner = model_name_to_check
+            self.depth_transform = transform_and_predict
+            
+            return self.depth_model, self.depth_transform
+            
+        except Exception as e:
+            print(f"FATAL: Failed to load Depth Anything V2: {e}")
+            print("Refiner: Falling back to disabled depth estimation.")
+
+            self.depth_model = None
+            self.depth_transform = None
+            return None, None
+        
     def load_upscaler_model(self, model_name):
         if self.upscaler_model is not None and self.upscaler_model_name == model_name:
             return self.upscaler_model
@@ -90,657 +279,1605 @@ class LatentRefiner:
             print(f"Error loading upscaler model {model_name}: {e}")
             self.upscaler_model = None; self.upscaler_model_name = None
             return None
+    
+    def analyze_image_to_preset(self, mood_image, target_h, target_w):
+       
+        try:
+            check_for_interruption()
+            device = mood_image.device
             
+            mood_image_bchw = mood_image.permute(0, 3, 1, 2)
+            orig_h, orig_w = mood_image_bchw.shape[-2:]
+            orig_aspect, target_aspect = orig_w / orig_h, target_w / target_h
+            new_h, new_w = (int(target_w / orig_aspect), target_w) if orig_aspect > target_aspect else (target_h, int(target_h * orig_aspect))
+            
+            resized_mood_image = F.interpolate(mood_image_bchw, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
+            image_lab = kornia.color.rgb_to_lab(resized_mood_image)
+            l_channel, a_channel, b_channel = image_lab[:, 0:1], image_lab[:, 1:2], image_lab[:, 2:3]
+            l_normalized = l_channel / 100.0
+            saturation = torch.sqrt(a_channel**2 + b_channel**2)
+            saturation_normalized = saturation / (saturation.max() + 1e-6)
+
+            numeric_brightness = torch.mean(l_normalized).item()
+            numeric_contrast = torch.std(l_normalized).item()
+            numeric_temperature = torch.mean(b_channel).item()
+            chromatic_intensity_map = l_normalized * saturation_normalized
+            avg_emissive_intensity = torch.mean(torch.topk(chromatic_intensity_map.view(-1), int(chromatic_intensity_map.numel() * 0.005)).values).item()
+            
+            emissive_mask = (chromatic_intensity_map > torch.quantile(chromatic_intensity_map, 0.995)).float()
+            
+            emissive_pixels_saturation = saturation_normalized[emissive_mask.bool()]
+
+            avg_emissive_saturation = torch.mean(emissive_pixels_saturation).item() if emissive_pixels_saturation.numel() > 0 else 0
+            black_point_presence = torch.mean((l_normalized < 0.1).float()).item()
+            
+            emissive_colors_raw = self._extract_colors_with_kmeans(resized_mood_image, emissive_mask, 2, device)
+            highlight_mask = (l_normalized > 0.85).float()
+            shadow_mask = (l_normalized < 0.15).float()
+            highlight_tint = resized_mood_image[highlight_mask.bool().expand_as(resized_mood_image)].view(3, -1).mean(dim=1).tolist() if highlight_mask.sum() > 0 else [1,1,1]
+            shadow_tint = resized_mood_image[shadow_mask.bool().expand_as(resized_mood_image)].view(3, -1).mean(dim=1).tolist() if shadow_mask.sum() > 0 else [0,0,0]
+            midtone_mask = (l_normalized >= 0.15) & (l_normalized <= 0.85)
+            accent_colors = self._extract_colors_with_kmeans(resized_mood_image, midtone_mask.float(), 3, device)
+            
+
+            darkness_score = 1.0 - numeric_brightness
+            contrast_score = min(numeric_contrast / 0.35, 1.0)
+            warmth_score = max(0, min(numeric_temperature / 20.0, 1.0))
+            coolness_score = max(0, min(-numeric_temperature / 20.0, 1.0))
+            emissive_score = min(avg_emissive_intensity / 0.7, 1.0)
+
+            mood_scores = {}
+
+            mood_scores["bright_natural"] = (
+                warmth_score * 0.3 +
+                (1.0 - darkness_score) * 0.25 +
+                (1.0 - black_point_presence) * 0.2 +
+                min(contrast_score / 0.6, 1.0) * 0.15 +
+                (1.0 - emissive_score * 0.5) * 0.1
+            )
+
+            mood_scores["warm_cinematic"] = (
+                warmth_score * 0.25 +
+                contrast_score * 0.25 +
+                min(black_point_presence * 5.0, 1.0) * 0.2 +
+                min(darkness_score * 1.5, 1.0) * 0.15 +
+                min(emissive_score * 1.2, 1.0) * 0.15
+            )
+
+            mood_scores["cool_dramatic"] = (
+                coolness_score * 0.3 +
+                darkness_score * 0.25 +
+                contrast_score * 0.2 +
+                min(black_point_presence * 4.0, 1.0) * 0.15 +
+                (1.0 - warmth_score) * 0.1
+            )
+
+            mood_scores["cyberpunk_vibrant"] = (
+                emissive_score * 0.35 +
+                min(avg_emissive_saturation * 1.2, 1.0) * 0.25 +
+                contrast_score * 0.2 +
+                (1.0 - warmth_score * 0.7) * 0.1 +
+                min((coolness_score + 0.3), 1.0) * 0.1
+            )
+
+            mood_type = max(mood_scores.keys(), key=lambda k: mood_scores[k])
+
+            temperature_adjustment = numeric_temperature
+            brightness_adjustment = (numeric_brightness - 0.7) * -40.0
+            brightness_adjustment = min(0, brightness_adjustment)
+            
+            if mood_type == "cyberpunk_vibrant":
+                atmospheric_effects = {"type": "cyberpunk_complex", "glow_colors": emissive_colors_raw, "complex_glows": True,
+                                        "intensity_multiplier": 1.8, "saturation_boost": 1.7, "coverage_multiplier": 1.3}
+            elif mood_type == "cool_dramatic":
+                atmospheric_effects = {"type": "mysterious_cool", "glow_colors": [highlight_tint], 
+                                        "intensity_multiplier": 1.4, "saturation_boost": 1.2, "coverage_multiplier": 1.1}
+            elif mood_type == "warm_cinematic":
+                atmospheric_effects = {"type": "warm_cinematic", "glow_colors": [highlight_tint],
+                                        "intensity_multiplier": 1.5, "saturation_boost": 1.3, "coverage_multiplier": 1.2}
+            else:
+                atmospheric_effects = {"type": "clean_natural", "glow_colors": [highlight_tint],
+                                        "intensity_multiplier": 1.2, "saturation_boost": 1.1, "coverage_multiplier": 1.0}
+
+            generated_preset = {
+                "mood_type": mood_type,
+                "color_palette": { "highlight_tint": highlight_tint, "shadow_tint": shadow_tint, "accent_colors": accent_colors },
+                "temperature_shift": temperature_adjustment,
+                "brightness_shift": brightness_adjustment,
+                "atmospheric_effects": atmospheric_effects
+            }
+            
+            return generated_preset
+
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            print(f"FATAL: Error analyzing mood image: {e}")
+
+            return {}
     def refine_and_process(self,
-                        operating_mode,
+                        enable_auto_tone,
                         enable_upscale, upscale_model, upscale_factor,
                         enable_dof_effect, dof_blur_strength,
                         relighting_mode, relight_strength,
-                        mood_strength, mood_background_replace,
-                        enable_dynamic_contrast, contrast_strength,
+                        mood_preset, mood_strength,
                         enable_vibrance, vibrance_strength,
                         enable_clarity, clarity_strength,
                         enable_smart_sharpen, sharpening_strength,
                         use_tiled_vae, tile_size,
-                        enable_latent_refinement, latent_refinement_strength,
                         latent=None, vae=None, image=None, mood_image=None, **kwargs):
         try:
-            refined_latent = latent
             check_for_interruption()
-
             device = model_management.get_torch_device()
 
-            if latent is not None and vae is not None:
-                decoded_image = vae.decode(latent["samples"].to(device))
-            elif image is not None:
-                decoded_image = image.to(device)
-            else:
+            is_latent_input = latent is not None and "samples" in latent
+            is_image_input = image is not None
+            
+            if not is_latent_input and not is_image_input:
                 print("Warning: No valid inputs provided. Please connect either (latent + vae) or image.")
-                dummy_latent = {"samples": torch.zeros((1, 4, 64, 64), dtype=torch.float32)}
-                dummy_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                return ({"samples": torch.zeros((1, 4, 64, 64))}, torch.zeros((1, 64, 64, 3)))
+            
+            input_key_tensor = latent["samples"] if is_latent_input else image
+            
+            decoded_image = None
+            if is_image_input:
+                decoded_image = image.to(device)
+            elif is_latent_input and vae is not None:
+                decoded_image = vae.decode(input_key_tensor.to(device))
+            
+            if decoded_image is None:
+                print("Warning: Cannot decode image. Processing cannot continue without a VAE for latents.")
+                dummy_latent = latent if is_latent_input else {"samples": torch.zeros((1, 4, 64, 64))}
+                dummy_image = image if is_image_input else torch.zeros((1, 64, 64, 3))
                 return (dummy_latent, dummy_image)
 
             image_to_process = decoded_image
+            
+            image_to_process = self.prepare_source_dynamics(image_to_process)
 
-            if enable_dof_effect or relighting_mode != "Disabled" or (mood_image is not None and mood_strength > 0):
-                image_to_process = self.apply_segmentation_effects(
-                    image_to_process,
-                    operating_mode,
-                    enable_dof_effect, dof_blur_strength,
-                    relighting_mode, relight_strength,
-                    mood_image, mood_strength, mood_background_replace
-                )
-                check_for_interruption()
+            image_bchw = image_to_process.permute(0, 3, 1, 2)
+            
+            is_mood_preset_active = (mood_preset != "Disabled" or mood_image is not None) and mood_strength > 0
+            is_relighting_active = relighting_mode != "Disabled" and relight_strength > 0
+            is_dof_active = enable_dof_effect and dof_blur_strength > 0
+            is_segmentation_needed = is_mood_preset_active or is_relighting_active or is_dof_active
+            is_depth_needed = is_dof_active
 
-            if enable_dynamic_contrast:
-                image_to_process = self.apply_dynamic_contrast_gpu(image_to_process, contrast_strength)
-                check_for_interruption()
+            is_cache_valid = (
+                self.cached_input_tensor is not None and
+                self.cached_input_tensor.shape == input_key_tensor.shape and
+                torch.equal(self.cached_input_tensor, input_key_tensor) and
+                (not is_segmentation_needed or self.cached_subject_mask is not None) and
+                (not is_depth_needed or self.cached_depth_map is not None)
+            )
+            
+            if not is_cache_valid and (is_segmentation_needed or is_depth_needed):
+                self.cached_input_tensor = input_key_tensor.clone()
+                self._run_and_cache_analysis(decoded_image, is_segmentation_needed, is_depth_needed)
+            
+            if is_mood_preset_active:
+                preset_data = {}
+                if mood_image is not None:
+                    target_h, target_w = image_bchw.shape[-2:]
+                    preset_data = self.analyze_image_to_preset(mood_image, target_h, target_w)
+                else:
+                    preset_data = mood_presets.PRESETS.get(mood_preset, {})
+                
+                if preset_data:
+                    image_bchw = self.apply_mood_and_lighting_transfer(
+                        image_bchw, self.cached_subject_mask, self.cached_depth_map, preset_data, mood_strength
+                    )
 
-            if enable_vibrance:
-                image_to_process = self.apply_vibrance_gpu(image_to_process, vibrance_strength)
-                check_for_interruption()
+            final_foreground = image_bchw.clone()
+            final_background = image_bchw.clone()
 
-            if enable_clarity:
-                image_to_process = self.apply_clarity_gpu(image_to_process, clarity_strength)
-                check_for_interruption()
+            if is_dof_active and self.cached_depth_map is not None and self.cached_subject_mask is not None:
+                final_background = self._apply_dof_pyramid(final_background, self.cached_subject_mask, self.cached_depth_map, dof_blur_strength, device)
 
-            final_image = image_to_process
+            if is_relighting_active and self.cached_subject_mask is not None:
+                if self.cached_subject_mask.sum() > 0:
+                    adjusted_relight_strength = relight_strength * 0.5 if is_mood_preset_active else relight_strength
+                    if relighting_mode == "Additive (Simple)":
+                        final_foreground = self.apply_professional_relighting(final_foreground, self.cached_subject_mask, (adjusted_relight_strength ** 0.7 * 1.8), device)
+                    elif relighting_mode == "Corrective":
+                        final_foreground = self.apply_correction_photo(final_foreground, self.cached_subject_mask, adjusted_relight_strength)
+
+            if self.cached_subject_mask is not None and (is_dof_active or is_relighting_active):
+                compositing_mask = self.cached_subject_mask
+                target_h, target_w = final_foreground.shape[-2:]
+                if final_background.shape[-2:] != (target_h, target_w) or compositing_mask.shape[-2:] != (target_h, target_w):
+                    final_background = F.interpolate(final_background, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                    compositing_mask = F.interpolate(compositing_mask, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                final_bchw = torch.lerp(final_background, final_foreground, compositing_mask)
+            else:
+                final_bchw = final_foreground
+            
+            final_bhwc = final_bchw.permute(0, 2, 3, 1)
+
+            if enable_vibrance: final_bhwc = self.apply_vibrance_gpu(final_bhwc, vibrance_strength)
+            if enable_clarity: final_bhwc = self.apply_clarity_gpu(final_bhwc, clarity_strength)
+
+            if enable_auto_tone:
+                final_bhwc = self.finalize_tone_correction(final_bhwc)
+
+            final_image = final_bhwc
 
             if enable_upscale and upscale_factor > 1.0:
-                h, w = image_to_process.shape[1], image_to_process.shape[2]
-                target_h, target_w = int(h * upscale_factor), int(w * upscale_factor)
-
+                h_orig, w_orig = final_image.shape[1], final_image.shape[2]
+                target_h, target_w = int(h_orig * upscale_factor), int(w_orig * upscale_factor)
                 if upscale_model == "Simple: Bicubic (Standard)":
-                    print(f"Refiner: Using Simple Upscale (Bicubic) from {w}x{h} to {target_w}x{target_h}")
-                    final_image = F.interpolate(image_to_process.movedim(-1, 1),
-                                                size=(target_h, target_w),
-                                                mode='bicubic',
-                                                align_corners=False,
-                                                antialias=True)
-                    final_image = final_image.movedim(1, -1)
+                    final_image = F.interpolate(final_image.movedim(-1, 1), size=(target_h, target_w), mode='bicubic', align_corners=False, antialias=True).movedim(1, -1)
                 else:
-                    print(f"Refiner: Using AI Model '{upscale_model}' to upscale image.")
                     loaded_model = self.load_upscaler_model(upscale_model)
-                    if loaded_model is None:
-                        print(f"Warning: Upscaler model {upscale_model} failed to load. Skipping upscale.")
-                        final_image = image_to_process
+                    if loaded_model:
+                        ai_upscaled_image = nodes.NODE_CLASS_MAPPINGS['ImageUpscaleWithModel']().upscale(upscale_model=loaded_model, image=final_image)[0]
+                        final_image = F.interpolate(ai_upscaled_image.movedim(-1, 1), size=(target_h, target_w), mode='bicubic', align_corners=False, antialias=True).movedim(1, -1)
                     else:
-                        ImageUpscalerClass = nodes.NODE_CLASS_MAPPINGS['ImageUpscaleWithModel']
-                        upscaler_node = ImageUpscalerClass()
-                        ai_upscaled_image = upscaler_node.upscale(upscale_model=loaded_model, image=image_to_process)[0]
-                        check_for_interruption()
-
-                        if ai_upscaled_image.shape[1] != target_h or ai_upscaled_image.shape[2] != target_w:
-                            final_image = F.interpolate(ai_upscaled_image.movedim(-1, 1),
-                                                        size=(target_h, target_w),
-                                                        mode='bicubic', align_corners=False, antialias=True)
-                            final_image = final_image.movedim(1, -1)
-                        else:
-                            final_image = ai_upscaled_image
+                        print(f"Warning: Upscaler model {upscale_model} failed to load. Skipping upscale.")
 
             if enable_smart_sharpen and sharpening_strength > 0:
                 final_image = self.apply_smart_sharpen(final_image, sharpening_strength)
-                check_for_interruption()
 
             final_image = final_image.to(device)
-
+            
+            refined_latent = None
             if vae is not None:
+                clamped_final_image = torch.clamp(final_image, 0.0, 1.0)
                 if use_tiled_vae:
-                    encoder = nodes.NODE_CLASS_MAPPINGS['VAEEncodeTiled']()
-                    refined_latent = encoder.encode(vae, final_image, tile_size, 64)[0]
+                    encode_node = nodes.NODE_CLASS_MAPPINGS['VAEEncodeTiled']()
+                    refined_latent = encode_node.encode(vae, clamped_final_image, tile_size)[0]
                 else:
-                    encoder = nodes.NODE_CLASS_MAPPINGS['VAEEncode']()
-                    refined_latent = encoder.encode(vae, final_image)[0]
-
-                if not isinstance(refined_latent, dict):
-                    refined_latent = {"samples": refined_latent}
-
-                if enable_latent_refinement:
-                    enhanced_samples = self.apply_latent_refinement(
-                        refined_latent["samples"], latent_refinement_strength
-                    )
-                    refined_latent["samples"] = enhanced_samples
-                    check_for_interruption()
+                    encode_node = nodes.NODE_CLASS_MAPPINGS['VAEEncode']()
+                    refined_latent = encode_node.encode(vae, clamped_final_image)[0]
+                
+                if not isinstance(refined_latent, dict): refined_latent = {"samples": refined_latent}
+            
+            if refined_latent is None:
+                h_final, w_final = final_image.shape[1], final_image.shape[2]
+                refined_latent = {"samples": torch.zeros((1, 4, h_final // 8, w_final // 8), dtype=torch.float32, device=device)}
 
             return (refined_latent, final_image.cpu())
 
         except model_management.InterruptProcessingException:
             print("Refiner cancelled by user")
+            self.cached_input_tensor = None
             raise
         except Exception as e:
-            print(f"Error in Refiner: {e}")
             import traceback
+            print(f"FATAL Error in Refiner: {e}")
             traceback.print_exc()
-            dummy_latent = {"samples": torch.zeros((1, 4, 64, 64), dtype=torch.float32)} if latent is None else latent
-            dummy_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32) if image is None else image
+            dummy_latent = {"samples": torch.zeros((1, 4, 64, 64))}
+            dummy_image = torch.zeros((1, 64, 64, 3))
+            if is_latent_input and latent is not None: dummy_latent = latent
+            if is_image_input and image is not None: dummy_image = image
             return (dummy_latent, dummy_image)
-
-    def _analyze_mood_image(self, mood_image_bchw, device):
-        """
-        Performs a definitive, multi-tone color analysis using a k-means approximation
-        to find the most dominant color in each tonal range for maximum accuracy.
-        """
-        try:
-            with torch.no_grad():
-                mood_gray = kornia.color.rgb_to_grayscale(mood_image_bchw)
-                
-                def get_dominant_color(image_bchw, mask):
-                    # Check if there are enough pixels to analyze
-                    if mask.sum() < 100:
-                        return None
-                    
-                    # Apply mask and prepare pixels for analysis
-                    pixels = image_bchw * mask
-                    pixels = pixels.permute(0, 2, 3, 1).reshape(-1, 3)
-                    valid_pixels = pixels[mask.reshape(-1), :]
-
-                    if valid_pixels.shape[0] < 3: # Not enough pixels for k-means
-                        return torch.mean(valid_pixels, dim=0)
-
-                    # Simple k-means approximation to find the dominant color cluster
-                    # We use a small number of iterations for speed
-                    centroids = valid_pixels[torch.randperm(valid_pixels.shape[0])[:1]]
-                    for _ in range(5):
-                        distances = torch.cdist(valid_pixels, centroids)
-                        labels = torch.argmin(distances, dim=1)
-                        # Check for empty clusters before calculating the mean
-                        if torch.bincount(labels).shape[0] > 0:
-                            new_centroids = torch.stack([valid_pixels[labels == i].mean(dim=0) for i in range(1) if (labels == i).any()])
-                            if new_centroids.shape[0] == 1:
-                                centroids = new_centroids
-                    return centroids[0]
-
-                # 1. Highlight Color Analysis
-                highlight_mask = mood_gray >= 0.7
-                accent_color = get_dominant_color(mood_image_bchw, highlight_mask)
-                
-                # 2. Mid-tone Color Analysis
-                mid_tone_mask = (mood_gray >= 0.3) & (mood_gray < 0.7)
-                main_color = get_dominant_color(mood_image_bchw, mid_tone_mask)
-
-                # 3. Shadow Color Analysis
-                shadow_mask = mood_gray < 0.3
-                shadow_color = get_dominant_color(mood_image_bchw, shadow_mask)
-
-                # Fallbacks if a specific tonal range is missing
-                if main_color is None: main_color = torch.mean(mood_image_bchw, dim=(2,3)).squeeze()
-                if accent_color is None: accent_color = torch.clamp(main_color * 1.4, 0, 1)
-                if shadow_color is None: shadow_color = torch.clamp(main_color * 0.6, 0, 1)
-
-                return {
-                    "main_color": main_color,
-                    "accent_color": accent_color,
-                    "shadow_color": shadow_color,
-                }
-                
-        except Exception as e:
-            print(f"Error in dominant color analysis: {e}")
-            return {
-                "main_color": torch.tensor([0.5, 0.5, 0.5], device=device),
-                "accent_color": torch.tensor([0.8, 0.8, 0.8], device=device),
-                "shadow_color": torch.tensor([0.2, 0.2, 0.2], device=device)
-            }
-    def _create_influence_zones(self, subject_mask, h, w, device):
-        """
-        Creates different influence zones for mood transfer:
-        - Core: Minimal influence (preserve character)
-        - Edge: Medium influence (blend with environment)  
-        - Background: Full influence
-        """
+    def apply_auto_tone_correction_gpu(self, image_tensor):
         try:
             check_for_interruption()
             
-            scale_factor = min(h, w) / 1024.0
+            prepared_image = self.prepare_source_dynamics(image_tensor)
+            final_image = self.finalize_tone_correction(prepared_image)
             
-            # Create a softened mask for general compositing and background calculations
-            edge_blur = max(8.0 * scale_factor, 2.0)
-            edge_kernel_size = int(edge_blur * 2) | 1
-            soft_subject_mask = kornia.filters.gaussian_blur2d(
-                subject_mask, 
-                (edge_kernel_size, edge_kernel_size), 
-                (edge_blur, edge_blur)
-            )
+            return final_image
 
-            # Create core mask (eroded subject mask) to protect the character's center
-            core_erosion = max(int(10 * scale_factor), 2) # Slightly larger erosion
-            core_kernel_size = core_erosion * 2 + 1
-            core_kernel = torch.ones(core_kernel_size, core_kernel_size, device=device)
-            core_mask = kornia.morphology.erosion(soft_subject_mask, core_kernel)
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            import traceback
+            print(f"FATAL Error in auto tone correction: {e}")
+            traceback.print_exc()
+            return image_tensor
+    def prepare_source_dynamics(self, image_tensor):
+        try:
+            check_for_interruption()
+            original_device = image_tensor.device
+
+            recovered_tensor = self._recover_channel_clipping_gpu(image_tensor)
             
-            # Edge zone is the transition area between the core and the full background
-            edge_mask = torch.clamp(soft_subject_mask - core_mask, 0, 1)
+            image_np = recovered_tensor.cpu().numpy().astype(np.float64)
+            prepared_images = []
+
+            for i in range(image_np.shape[0]):
+                img = image_np[i]
+                
+                lab_img = rgb2lab(img)
+                l_channel = lab_img[:, :, 0]
+                l_channel_normalized = l_channel / 100.0
+                
+                shadow_clip_point = np.percentile(l_channel_normalized, 1)
+                highlight_clip_point = np.percentile(l_channel_normalized, 99)
+                
+                if shadow_clip_point < 0.02 or highlight_clip_point > 0.98:
+                    prepared_l_normalized = self._prevent_clipping_preserve_detail(
+                        l_channel_normalized, shadow_clip_point, highlight_clip_point
+                    )
+                else:
+                    prepared_l_normalized = l_channel_normalized
+                
+                prepared_l = prepared_l_normalized * 100.0
+                prepared_lab = lab_img.copy()
+                prepared_lab[:, :, 0] = prepared_l
+                
+                prepared_rgb = lab2rgb(prepared_lab)
+                prepared_images.append(prepared_rgb)
+
+            final_np = np.stack(prepared_images).astype(np.float32)
+            final_tensor = torch.from_numpy(final_np).to(original_device)
             
-            # Background is everything not covered by the soft subject mask
-            background_mask = 1.0 - soft_subject_mask
+            return torch.clamp(final_tensor, 0.0, 1.0)
+
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            import traceback
+            print(f"FATAL Error during source dynamics preparation: {e}")
+            traceback.print_exc()
+            return image_tensor    
+    def finalize_tone_correction(self, image_tensor):
+        if not SKIMAGE_AVAILABLE:
+            print("-------------------------------------------------------------------------------------------------")
+            print("WARNING: scikit-image library not found.")
+            print("Please install it by running: pip install scikit-image")
+            print("Skipping Final Tone Correction.")
+            print("-------------------------------------------------------------------------------------------------")
+            return image_tensor
+
+        try:
+            check_for_interruption()
+            print("Finalize tone correction is running")
+            original_device = image_tensor.device
+            print(f"DEBUG: Input to finalize_tone_correction - min: {image_tensor.min():.3f}, max: {image_tensor.max():.3f}")
+        
+            image_np = image_tensor.cpu().numpy().astype(np.float64)
+            corrected_images = []
+
+            for i in range(image_np.shape[0]):
+                img = image_np[i]
+                
+                lab_img = rgb2lab(img)
+                l_channel = lab_img[:, :, 0]
+                a_channel = lab_img[:, :, 1]
+                b_channel = lab_img[:, :, 2]
+                l_channel_normalized = l_channel / 100.0
+                
+                shadow_clip_point = np.percentile(l_channel_normalized, 1)
+                highlight_clip_point = np.percentile(l_channel_normalized, 99)
+                print(f"DEBUG: Running FULL tone correction (shadow: {shadow_clip_point:.3f}, highlight: {highlight_clip_point:.3f})")
+
+                corrected_l_normalized = self._prevent_clipping_preserve_detail(
+                    l_channel_normalized, shadow_clip_point, highlight_clip_point
+                )
+
+                corrected_l_normalized = self._apply_smooth_post_processing(corrected_l_normalized)
+                safe_shadow_level = 0.02
+
+                corrected_l_normalized = self._intelligently_deepen_blacks(
+                    corrected_l_normalized, a_channel, b_channel, safe_shadow_level
+                )
+
+                print(f"DEBUG: After full correction - min: {np.min(corrected_l_normalized):.3f}, max: {np.max(corrected_l_normalized):.3f}")
+                
+                corrected_l = corrected_l_normalized * 100.0
+                corrected_lab = lab_img.copy()
+                corrected_lab[:, :, 0] = corrected_l
+                
+                corrected_rgb = lab2rgb(corrected_lab)
+                corrected_images.append(corrected_rgb)
+
+            final_np = np.stack(corrected_images).astype(np.float32)
+            final_tensor = torch.from_numpy(final_np).to(original_device)
             
-            return {
-                'core_mask': core_mask,
-                'edge_mask': edge_mask, 
-                'background_mask': background_mask,
-                'soft_subject_mask': soft_subject_mask
-            }
+            return torch.clamp(final_tensor, 0.0, 1.0)
+
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            import traceback
+            print(f"FATAL Error during final tone correction: {e}")
+            traceback.print_exc()
+            return image_tensor
+    def apply_clipping_protection(self, image_bchw):
+        try:
+            check_for_interruption()
+            
+            protected_image = torch.clamp(image_bchw, 0.02, 0.98)
+            
+            image_lab = kornia.color.rgb_to_lab(protected_image)
+            l_channel = image_lab[:, 0:1] / 100.0
+            
+            highlight_mask = (l_channel > 0.95).float()
+            shadow_mask = (l_channel < 0.05).float()
+            
+            if torch.sum(highlight_mask) > 0:
+                l_channel = torch.where(highlight_mask > 0, torch.clamp(l_channel, 0, 0.95), l_channel)
+            
+            if torch.sum(shadow_mask) > 0:
+                l_channel = torch.where(shadow_mask > 0, torch.clamp(l_channel, 0.05, 1), l_channel)
+            
+            corrected_lab = torch.cat([l_channel * 100.0, image_lab[:, 1:3]], dim=1)
+            corrected_rgb = kornia.color.lab_to_rgb(corrected_lab)
+            
+            return torch.clamp(corrected_rgb, 0.0, 1.0)
             
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error creating influence zones: {e}")
-            # Fallback to a simple subject/background split with a soft edge
-            edge_blur = max(8.0 * min(h, w) / 1024.0, 2.0)
-            edge_kernel_size = int(edge_blur * 2) | 1
-            soft_mask = kornia.filters.gaussian_blur2d(subject_mask, (edge_kernel_size, edge_kernel_size), (edge_blur, edge_blur))
-            
-            return {
-                'core_mask': subject_mask,
-                'edge_mask': torch.zeros_like(subject_mask), # No separate edge in simple fallback
-                'background_mask': 1.0 - soft_mask,
-                'soft_subject_mask': soft_mask
-            }
-    
-    def _blend_color_lab(self, image_bchw, target_color_rgb, blend_strength):
+            print(f"Warning: Clipping protection failed: {e}")
+            return torch.clamp(image_bchw, 0.0, 1.0)
+    def _prevent_clipping_preserve_detail(self, luminance, shadow_clip, highlight_clip):
         """
-        Blends a target color onto an image in the LAB color space.
-        This preserves the original image's luminosity, preventing it from getting
-        washed out or overblown, while effectively transferring the color mood.
+        Prevents clipping by lifting truly crushed blacks AND compressing truly blown-out highlights.
+        --- DEFINITIVE VERSION ---
+        This version applies the same precise logic to both shadows and highlights, ensuring that
+        only pixels on the verge of clipping (near 0.0 or 1.0) are adjusted, while leaving
+        all other tones untouched.
+        """
+        result = luminance.copy()
+        
+        # --- Define Symmetrical Levels ---
+        
+        # Shadow Levels
+        safe_shadow_level = 0.02      # The target we lift crushed blacks TO.
+        shadow_clipping_threshold = 0.005 # The strict mask to identify WHAT IS a crushed black.
 
-        Args:
-            image_bchw: The source image tensor (Batch, Channels, Height, Width).
-            target_color_rgb: A torch tensor for the target color, e.g., torch.tensor([r, g, b]).
-            blend_strength: How strongly to apply the color (0.0 to 1.0).
+        # Highlight Levels
+        safe_highlight_level = 0.93     # The target we compress blown-out whites TO.
+        highlight_clipping_threshold = 0.995 # The strict mask to identify WHAT IS a blown-out white.
 
-        Returns:
-            The color-blended image tensor in RGB format.
+        # --- Corrected Shadow Lifting Logic ---
+        # Entry Condition: Is the image dark enough to potentially have crushed blacks?
+        if shadow_clip < safe_shadow_level:
+            # Selection Mask: Is a pixel *actually* crushed below the strict threshold?
+            pixels_to_lift_mask = result < shadow_clipping_threshold
+            
+            if np.any(pixels_to_lift_mask):
+                original_values = result[pixels_to_lift_mask]
+                lift_needed = safe_shadow_level - original_values
+                blend_weight = (1.0 - (original_values / safe_shadow_level)) ** 1.5
+                result[pixels_to_lift_mask] = original_values + (lift_needed * blend_weight)
+
+        # --- Symmetrical Highlight Compression Logic ---
+        # Entry Condition: Is the image bright enough to potentially have blown-out highlights?
+        if highlight_clip > safe_highlight_level:
+            # Selection Mask: Is a pixel *actually* blown-out above the strict threshold?
+            pixels_to_compress_mask = result > highlight_clipping_threshold
+
+            if np.any(pixels_to_compress_mask):
+                original_values = result[pixels_to_compress_mask]
+
+                # Calculate how much we need to reduce the highlights to bring them to the safe level.
+                compression_needed = original_values - safe_highlight_level
+
+                # Create a blend weight. The effect is strongest for pure white (1.0) and fades to nothing
+                # as the pixel value approaches the clipping threshold.
+                # This prevents a hard edge at the boundary of the mask.
+                blend_weight = ((original_values - highlight_clipping_threshold) / (1.0 - highlight_clipping_threshold)) ** 1.5
+                
+                # Apply the targeted compression.
+                result[pixels_to_compress_mask] = original_values - (compression_needed * blend_weight)
+        
+        return np.clip(result, 0, 1)
+    def _recover_channel_clipping_gpu(self, image_tensor_bhwc):
+        """
+        Recovers detail from pre-clipped R, G, or B channels in the source image.
+        This runs FIRST, before any other tonal adjustments.
         """
         try:
-            # Convert source image to LAB
-            source_lab = kornia.color.rgb_to_lab(image_bchw)
+            # --- Setup ---
+            original_device = image_tensor_bhwc.device
+            image_bchw = image_tensor_bhwc.permute(0, 3, 1, 2)
             
-            # Create a full image of the target color and convert it to LAB
+            highlight_clipping_threshold = 0.995 # Identifies what IS clipped.
+            safe_highlight_level = 0.98         # Defines the target to recover TO.
+            
+            # --- Identify Clipped Pixels ---
+            # Create a mask for any pixel where any channel is blown out.
+            clipping_mask = torch.any(image_bchw > highlight_clipping_threshold, dim=1, keepdim=True)
+
+            if not torch.any(clipping_mask):
+                return image_tensor_bhwc # Return original if no clipping is found.
+
+            # --- Recover Detail ---
+            # Convert the entire image to HSV to manipulate brightness (Value) without affecting color (Hue).
+            hsv_image = kornia.color.rgb_to_hsv(image_bchw)
+            h, s, v = hsv_image[:, 0:1], hsv_image[:, 1:2], hsv_image[:, 2:3]
+            
+            # Isolate the HSV components for only the pixels we need to fix.
+            clipped_h = h[clipping_mask.expand_as(h)].view(1, 1, -1, 1)
+            clipped_s = s[clipping_mask.expand_as(s)].view(1, 1, -1, 1)
+            clipped_v = v[clipping_mask.expand_as(v)].view(1, 1, -1, 1)
+
+            # --- Binary Search for the correct brightness ---
+            # We search for the highest possible 'Value' that keeps all RGB channels safely below our target.
+            low = torch.zeros_like(clipped_v) # The darkest possible value is 0.
+            high = clipped_v                  # The brightest possible is its current value.
+
+            for _ in range(8): # 8 iterations is enough for 8-bit precision.
+                mid_v = (low + high) / 2.0
+                # Create a test image using the mid-point Value
+                test_hsv = torch.cat([clipped_h, clipped_s, mid_v], dim=1)
+                test_rgb = kornia.color.hsv_to_rgb(test_hsv)
+                
+                # Check if this test Value results in an RGB color that is safely in gamut.
+                is_safe = torch.all(test_rgb <= safe_highlight_level, dim=1, keepdim=True)
+                
+                # If it's safe, we can afford to try a brighter Value.
+                low = torch.where(is_safe, mid_v, low)
+                # If it's not safe, the Value is still too high.
+                high = torch.where(is_safe, high, mid_v)
+
+            # 'low' now holds the optimal recovered brightness. Update the main image's Value channel.
+            v.masked_scatter_(clipping_mask.expand_as(v), low.flatten())
+            
+            # Convert the corrected HSV image back to RGB.
+            recovered_bchw = kornia.color.hsv_to_rgb(torch.cat([h, s, v], dim=1))
+            
+            # Return in the original BHWC format.
+            return recovered_bchw.permute(0, 2, 3, 1)
+
+        except Exception as e:
+            print(f"FATAL Error during channel highlight recovery: {e}")
+            return torch.clamp(image_tensor_bhwc, 0.0, 1.0)
+    def _intelligently_deepen_blacks(self, luminance, lab_a, lab_b, safe_shadow_level):
+        """
+        Deepens blacks using a smoothed, continuous, and dynamically modulated strength map.
+        --- DEFINITIVE VERSION ---
+        This version fixes harsh masking artifacts by replacing the binary mask with a
+        smooth, feathered weight map and by smoothing the modulation maps themselves.
+        """
+        result = luminance.copy()
+        
+        analysis = self._analyze_black_deepening_requirements(luminance, safe_shadow_level)
+        
+        safe_black_start = safe_shadow_level
+        safe_black_end = np.clip(0.35 + analysis['black_end_adjustment'], 0.25, 0.45)
+        
+        # --- LOGGING (Unchanged) ---
+        print("=" * 60)
+        print("BLACK DEEPENING ANALYSIS (DEFINITIVE - Smoothed Masks)")
+        print("=" * 60)
+        # ... (rest of the initial logging)
+        
+        # --- THE FIX 1: Create a Smooth, Continuous Weight Mask ---
+        # Instead of a hard binary mask, we create a feathered "bell curve" mask.
+        center_of_range = (safe_black_start + safe_black_end) / 2.0
+        width_of_range = (safe_black_end - safe_black_start)
+        # Calculate how far each pixel is from the center of our target range.
+        distance_from_center = np.abs(luminance - center_of_range)
+        # Create a smooth falloff. A pixel at the center has a weight of 1.0.
+        # The weight drops to 0.0 as it approaches the start or end of the range.
+        range_weight_mask = np.clip(1.0 - (distance_from_center / (width_of_range / 2.0)), 0.0, 1.0)
+        # Apply a power to the curve to control the feathering.
+        range_weight_mask = np.power(range_weight_mask, 0.8)
+
+        if not np.any(range_weight_mask > 0):
+             return result # Exit if no pixels are meaningfully in range
+
+        # --- THE FIX 2: Smooth the Modulation Maps ---
+        if SCIPY_AVAILABLE:
+            # Calculate the raw modulation maps as before
+            blurred_luminance = ndimage.gaussian_filter(luminance, sigma=1.5)
+            detail_map = np.abs(luminance - blurred_luminance)
+            flatness_modulation_raw = 1.6 - np.tanh(detail_map * 20.0) * 1.1
+            # NOW, SMOOTH THE MASK ITSELF to eliminate pixel-level noise and create a regional effect.
+            flatness_modulation = ndimage.gaussian_filter(flatness_modulation_raw, sigma=2.0)
+        else:
+            flatness_modulation = np.ones_like(result)
+
+        saturation = np.sqrt(lab_a**2 + lab_b**2)
+        color_protection_raw = 1.0 - np.tanh(saturation / 40.0) * 0.6
+        # SMOOTH THE COLOR MASK as well for consistency.
+        color_protection = ndimage.gaussian_filter(color_protection_raw, sigma=2.0)
+        
+        # --- Combine and Apply ---
+        base_alpha = analysis['max_deepening_strength'] * analysis['deepening_strength_multiplier']
+        
+        # The final strength is a combination of all our smooth masks.
+        final_alpha_map = base_alpha * range_weight_mask * flatness_modulation * color_protection
+        final_alpha_map = final_alpha_map * 1.5  # Boost overall strength
+        final_alpha_map = np.clip(final_alpha_map, 0.0, 0.95)
+
+        # Calculate the ideal 'deepened' look for the entire image
+        range_compression_factor = np.clip(1.0 - (analysis['deepening_strength_multiplier'] - 1.0) * 0.25, 0.75, 1.0)
+        black_range = safe_black_end - safe_black_start
+        compressed_black_range = black_range * range_compression_factor
+        normalized_position = np.clip((luminance - safe_black_start) / black_range, 0.0, 1.0)
+        curved_position = np.power(normalized_position, analysis['deepening_curve_power'])
+        target_deepened_values = safe_black_start + (curved_position * compressed_black_range)
+        
+        # Linearly interpolate between the original and the ideal look using our final smooth map.
+        # This is a per-pixel, feathered blend that avoids all hard edges.
+        final_result = (luminance * (1 - final_alpha_map)) + (target_deepened_values * final_alpha_map)
+
+        print(f"DEBUG: Black deepening effect:")
+        print(f"  Original range: {np.min(luminance):.3f} - {np.max(luminance):.3f}")
+        print(f"  Target range: {np.min(target_deepened_values):.3f} - {np.max(target_deepened_values):.3f}")
+        print(f"  Final range: {np.min(final_result):.3f} - {np.max(final_result):.3f}")
+        print(f"  Alpha map range: {np.min(final_alpha_map):.3f} - {np.max(final_alpha_map):.3f}")
+        print(f"  Pixels getting >50% effect: {np.mean(final_alpha_map > 0.5):.3f}")
+        print(f"\nDeepening Statistics:")
+        print(f"  Base Alpha: {base_alpha:.3f}")
+        print(f"  Final Blend Alpha - Min: {np.min(final_alpha_map):.3f}, Avg: {np.mean(final_alpha_map):.3f}, Max: {np.max(final_alpha_map):.3f}")
+
+        return final_result
+    def _analyze_black_deepening_requirements(self, luminance, safe_shadow_level):
+        """
+        Analyzes the image to determine optimal black deepening parameters.
+        --- REVISED v2 ---
+        This version adjusts the weighting to be less conservative on high-contrast images
+        that still have "muddy" shadow regions, allowing for a stronger base effect.
+        """
+        try:
+            lum_np = luminance.cpu().numpy() if hasattr(luminance, 'cpu') else luminance
+            
+            # --- Core Image Metrics ---
+            lum_std = np.std(lum_np)
+            lum_mean = np.mean(lum_np)
+            contrast_ratio = lum_std / (lum_mean + 1e-8)
+            
+            true_blacks = np.mean(lum_np < 0.05)
+            dark_shadows = np.mean(lum_np < 0.15)
+            medium_shadows = np.mean((lum_np >= 0.15) & (lum_np < 0.3))
+            
+            midtone_concentration = np.mean((lum_np >= 0.3) & (lum_np <= 0.7))
+            
+            # --- DYNAMIC FACTORS ---
+            
+            # Contrast Factor: Penalizes high contrast, but less aggressively than before.
+            contrast_sigmoid = 1.0 / (1.0 + np.exp((contrast_ratio - 0.4) * 10.0))
+            contrast_factor = contrast_sigmoid * 0.8 + 0.2
+
+            # Black Deficit Factor: Stronger signal when blacks are needed.
+            optimal_black_percentage = 0.075
+            distance_from_optimal = np.abs(true_blacks - optimal_black_percentage)
+            black_deficit_factor = np.exp(-np.power(distance_from_optimal / 0.1, 2))
+
+            midtone_optimal = 0.45
+            midtone_distance = np.abs(midtone_concentration - midtone_optimal)
+            midtone_factor = np.exp(-np.power(midtone_distance / 0.25, 2))
+            
+            # THE FIX: Adjust the final weighting. 'black_deficit' now has the strongest voice,
+            # and 'contrast' has less power to veto the operation.
+            combined_factor = np.clip((
+                contrast_factor * 0.20 +
+                black_deficit_factor * 0.50 +
+                midtone_factor * 0.30
+            ), 0.0, 1.0)
+            
+            # --- Final Parameter Calculation ---
+            strength_multiplier = 0.8 + (combined_factor * 1.2)
+            
+            contrast_restriction = -0.08 * np.power(np.clip((contrast_ratio - 0.45) / 0.5, 0.0, 1.0), 1.5)
+            midtone_extension = 0.1 * np.power(np.clip((midtone_concentration - 0.4) / 0.3, 0.0, 1.0), 0.8)
+            black_end_adjustment = contrast_restriction + midtone_extension
+            black_end_adjustment = np.clip(black_end_adjustment, -0.1, 0.12)
+            
+            shadow_normalized = np.clip(dark_shadows, 0.05, 0.45)
+            curve_power = 1.1 + 0.7 * np.power((0.45 - shadow_normalized) / 0.4, 0.8)
+            
+            max_deepening_strength = 0.20 + (combined_factor * 0.50)
+            max_deepening_strength = np.clip(max_deepening_strength, 0.15, 0.7)
+            print(f"DEBUG: Black Analysis - contrast_ratio: {float(contrast_ratio):.3f}")
+            print(f"DEBUG: Black Analysis - true_blacks: {float(true_blacks):.3f} (want ~0.075)")
+            print(f"DEBUG: Black Analysis - combined_factor: {float(combined_factor):.3f}")
+            print(f"DEBUG: Black Analysis - strength_multiplier: {float(strength_multiplier):.3f}")
+            print(f"DEBUG: Black Analysis - max_deepening_strength: {float(max_deepening_strength):.3f}")
+            return {
+                'contrast_ratio': float(contrast_ratio),
+                'true_blacks_percentage': float(true_blacks),
+                'dark_shadows_percentage': float(dark_shadows),
+                'medium_shadows_percentage': float(medium_shadows),
+                'midtone_concentration': float(midtone_concentration),
+                'deepening_strength_multiplier': float(strength_multiplier),
+                'black_end_adjustment': float(black_end_adjustment),
+                'deepening_curve_power': float(curve_power),
+                'max_deepening_strength': float(max_deepening_strength),
+                'combined_factor': float(combined_factor),
+                'contrast_factor': float(contrast_factor),
+                'black_deficit_factor': float(black_deficit_factor),
+                'midtone_factor': float(midtone_factor)
+            }
+            
+        except Exception as e:
+            print(f"Error in black deepening analysis: {e}")
+            # Return safe defaults
+            return {'deepening_strength_multiplier': 1.0, 'black_end_adjustment': 0.0, 'deepening_curve_power': 1.2, 'max_deepening_strength': 0.4}
+    def _preserve_black_detail(self, luminance, safe_shadow_level, safe_black_end):
+
+        
+        if SCIPY_AVAILABLE:
+            
+            black_region_mask = (luminance >= safe_shadow_level) & (luminance <= safe_black_end)
+            
+            if np.any(black_region_mask):
+                sigma = 1.0
+                blurred = ndimage.gaussian_filter(luminance, sigma=sigma)
+                detail_enhancement = (luminance - blurred) * 0.3
+                
+                result = luminance.copy()
+                result[black_region_mask] += detail_enhancement[black_region_mask]
+                
+                return np.clip(result, safe_shadow_level, 1.0)
+            
+        else:
+            return self._simple_black_detail_preserve(luminance, safe_shadow_level, safe_black_end)
+        
+        return luminance
+
+    def _simple_black_detail_preserve(self, luminance, safe_shadow_level, safe_black_end):
+    
+        
+        result = luminance.copy()
+        black_region_mask = (result >= safe_shadow_level) & (result <= safe_black_end)
+        
+        if np.any(black_region_mask):
+            padded = np.pad(result, 2, mode='reflect')
+            
+            for y in range(2, padded.shape[0] - 2):
+                for x in range(2, padded.shape[1] - 2):
+                    orig_y, orig_x = y - 2, x - 2
+                    if orig_y < result.shape[0] and orig_x < result.shape[1] and black_region_mask[orig_y, orig_x]:
+                        local_avg = np.mean(padded[y-1:y+2, x-1:x+2])
+                        detail_diff = result[orig_y, orig_x] - local_avg
+                        result[orig_y, orig_x] += detail_diff * 0.1
+        
+        return np.clip(result, safe_shadow_level, 1.0)
+    def _apply_smooth_post_processing(self, luminance):
+
+        
+        if SCIPY_AVAILABLE:
+            min_dim = min(luminance.shape[0], luminance.shape[1])
+            
+            if min_dim > 1024:
+                sigma = 1.0
+            elif min_dim > 512:
+                sigma = 0.7
+            else:
+                sigma = 0.4
+                
+            smoothed = ndimage.gaussian_filter(luminance, sigma=sigma, mode='reflect')
+            
+            blend_factor = 0.15
+            result = luminance * (1 - blend_factor) + smoothed * blend_factor
+            
+            return result
+        else:
+            return self._simple_neighbor_smooth(luminance)
+
+    def _simple_neighbor_smooth(self, luminance):
+   
+        
+        padded = np.pad(luminance, 1, mode='reflect')
+        
+        result = luminance.copy()
+        
+        for y in range(1, padded.shape[0] - 1):
+            for x in range(1, padded.shape[1] - 1):
+                if y-1 < result.shape[0] and x-1 < result.shape[1]:
+                    center = padded[y, x] * 0.6
+                    neighbors = (padded[y-1:y+2, x-1:x+2].sum() - padded[y, x]) * 0.4 / 8
+                    result[y-1, x-1] = center + neighbors
+        
+        return result
+   
+   
+    def _tint_in_lab(self, image_bchw, target_color_rgb, mask):
+
+        try:
+            if not isinstance(target_color_rgb, torch.Tensor):
+                target_color_rgb = torch.tensor(target_color_rgb, device=image_bchw.device, dtype=image_bchw.dtype)
+            
+            source_lab = kornia.color.rgb_to_lab(image_bchw)
             target_color_image = target_color_rgb.view(1, 3, 1, 1).expand_as(image_bchw)
             target_lab = kornia.color.rgb_to_lab(target_color_image)
+            
             target_a = target_lab[:, 1:2]
             target_b = target_lab[:, 2:3]
+
+            blended_a = torch.lerp(source_lab[:, 1:2], target_a, mask)
+            blended_b = torch.lerp(source_lab[:, 2:3], target_b, mask)
             
-            # Blend the 'a' and 'b' (color) channels
-            # We keep the original 'L' (lightness) channel from the source image
-            blended_a = torch.lerp(source_lab[:, 1:2], target_a, blend_strength)
-            blended_b = torch.lerp(source_lab[:, 2:3], target_b, blend_strength)
-            
-            # Reconstruct the LAB image with original lightness and new colors
             final_lab = torch.cat([source_lab[:, 0:1], blended_a, blended_b], dim=1)
             
-            # Convert back to RGB and clamp
-            return torch.clamp(kornia.color.lab_to_rgb(final_lab), 0.0, 1.0)
+            return kornia.color.lab_to_rgb(final_lab)
             
         except Exception as e:
-            print(f"Error in _blend_color_lab: {e}")
+            print(f"Error in _tint_in_lab: {e}")
             return image_bchw
-    def _apply_atmospheric_glow_effects(self, image_bchw, mood_analysis, influence_zones, device):
-        """
-        Applies atmospheric glow effects using mood accent colors.
-        This function generates the full-strength (strength=1.0) version of the effect.
-        """
+   
+    def apply_mood_and_lighting_transfer(self, image_bchw, subject_mask, depth_map, preset_data, strength):
+  
+        try:
+            check_for_interruption()
+            if not preset_data or strength == 0.0:
+                return image_bchw
+            
+            for name, data in mood_presets.PRESETS.items():
+                if data == preset_data:
+                    break
+            
+
+            h, w = image_bchw.shape[-2:]
+            device = image_bchw.device
+            scale_factor = min(h, w) / 1024.0
+            
+            full_effect_image = self._apply_full_mood_effects(image_bchw, preset_data, scale_factor, depth_map)
+            
+            foreground_50_image = self._apply_reduced_mood_effects(image_bchw, preset_data, scale_factor, 0.4)
+            
+            mask_system = self._create_simple_mask_system(subject_mask, scale_factor, device, depth_map)
+            
+            final_result = self._merge_with_inward_feather(
+                full_effect_image, foreground_50_image, mask_system
+            )
+            
+            final_image = torch.lerp(image_bchw, final_result, strength)
+            print(f"DEBUG: Mood preset output BEFORE clipping protection - min: {final_image.min():.3f}, max: {final_image.max():.3f}")
+            final_image = self.apply_clipping_protection(final_image)
+
+            return final_image
+
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            print(f"FATAL: Error applying mood: {e}")
+            return image_bchw
+    def _extract_colors_with_kmeans(self, image_bchw, mask, n_clusters, device):
+
+        try:
+
+            mask_bool = mask.squeeze(0).squeeze(0) > 0.5
+
+            if mask_bool.sum() == 0:
+                return []
+
+            pixels = image_bchw.squeeze(0).permute(1, 2, 0)[mask_bool]
+
+            pixels = pixels.to(torch.float32)
+
+            
+            if not SKLEARN_AVAILABLE:
+                print("-------------------------------------------------------------------------------------------------")
+                print("WARNING: scikit-learn library not found.")
+                print("Please install it running requirements.txt")
+                print("-------------------------------------------------------------------------------------------------")
+                return []
+            
+            actual_clusters = min(n_clusters, pixels.shape[0])
+            if actual_clusters == 0:
+                return []
+
+            kmeans = KMeans(n_clusters=actual_clusters, random_state=0, n_init='auto').fit(pixels.cpu().numpy())
+            
+            colors_rgb = kmeans.cluster_centers_.tolist()
+
+            return colors_rgb
+
+        except Exception as e:
+            print(f"Warning: K-Means color extraction failed: {e}")
+            return []
+    
+    def _apply_full_mood_effects(self, image_bchw, preset_data, scale_factor, depth_map):
+   
         try:
             check_for_interruption()
             
             h, w = image_bchw.shape[-2:]
-            scale_factor = min(h, w) / 1024.0
+            device = image_bchw.device
             
-            result = image_bchw.clone()
-            accent_color = mood_analysis['accent_color'].view(1, 3, 1, 1)
+            background_mask = torch.ones((1, 1, h, w), device=device)
             
-            # 1. Ambient Glow (environmental lighting)
-            # This should subtly tint the entire scene, including the character's edges.
-            ambient_strength = 0.20 # Increased from 0.08
-            ambient_radius = max(25.0 * scale_factor, 10.0)
-            ambient_kernel_size = int(ambient_radius * 2) | 1
+            if depth_map is not None:
+                if depth_map.shape[-2:] != (h, w):
+                    depth_map = F.interpolate(depth_map, size=(h, w), mode='bilinear', align_corners=False)
+                
+                far_regions = (1.0 - depth_map).pow(1.2)
+                background_mask = background_mask * (0.7 + 0.3 * far_regions)
             
-            # The glow should emanate from the background and wrap around the subject
-            ambient_map = kornia.filters.gaussian_blur2d(
-                1.0 - influence_zones['soft_subject_mask'], 
-                (ambient_kernel_size, ambient_kernel_size), 
-                (ambient_radius, ambient_radius)
-            )
+            subject_mask_for_analysis = torch.ones((1, 1, h, w), device=device)
+            image_analysis = self._analyze_image_characteristics(image_bchw, subject_mask_for_analysis, scale_factor)
             
-            # Apply ambient glow with zone influence, affecting the character's edges and background
-            ambient_influence_mask = (influence_zones['core_mask'] * 0.2 + # Affects core slightly
-                                        influence_zones['edge_mask'] * 0.7 + 
-                                        influence_zones['background_mask'] * 1.0)
-            
-            ambient_glow = ambient_map * accent_color * ambient_strength * ambient_influence_mask
-            # Use screen blend for light addition
-            result = 1.0 - (1.0 - result) * (1.0 - ambient_glow)
-            
-            # 2. Highlight Enhancement (bloom/glow from bright spots)
-            original_gray = kornia.color.rgb_to_grayscale(image_bchw)
-            highlight_threshold = 0.7
-            highlight_mask = torch.clamp((original_gray - highlight_threshold) / (1.0 - highlight_threshold), 0, 1)
-            
-            # Blur highlights for glow effect
-            highlight_blur = max(15.0 * scale_factor, 5.0)
-            highlight_kernel_size = int(highlight_blur * 2) | 1
-            soft_highlight_mask = kornia.filters.gaussian_blur2d(
-                highlight_mask, 
-                (highlight_kernel_size, highlight_kernel_size), 
-                (highlight_blur, highlight_blur)
-            )
-            
-            # Define how strongly the highlight glow affects each zone
-            highlight_core_strength = 0.25 # Increased from 0.15
-            highlight_edge_strength = 0.40 # Increased from 0.25
-            highlight_bg_strength = 0.55 # Increased from 0.35
-            
-            highlight_influence = (influence_zones['core_mask'] * highlight_core_strength +
-                                    influence_zones['edge_mask'] * highlight_edge_strength +
-                                    influence_zones['background_mask'] * highlight_bg_strength)
-            
-            highlight_effect = soft_highlight_mask * accent_color * highlight_influence
-            # Use screen blend for light addition
-            result = 1.0 - (1.0 - result) * (1.0 - highlight_effect)
-            
-            # 3. Rim lighting (subtle edge enhancement on the subject)
-            edge_kernel_size = max(3, int(3 * scale_factor) | 1)
-            # Use a Sobel filter for cleaner edge detection from the soft mask
-            edge_mask = kornia.filters.sobel(influence_zones['soft_subject_mask'])
-
-            # Soften rim light
-            rim_blur = max(6.0 * scale_factor, 2.0)
-            rim_kernel_size = int(rim_blur * 2) | 1
-            soft_rim_mask = kornia.filters.gaussian_blur2d(
-                edge_mask, 
-                (rim_kernel_size, rim_kernel_size), 
-                (rim_blur, rim_blur)
-            )
-            
-            # Apply rim lighting
-            rim_strength = 0.45 # Increased from 0.2
-            rim_effect = soft_rim_mask * accent_color * rim_strength
-            result = 1.0 - (1.0 - result) * (1.0 - rim_effect)
-            
-            return torch.clamp(result, 0.0, 1.0)
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error applying atmospheric glow effects: {e}")
-            return image_bchw
-    def _apply_conservative_color_grading(self, image_bchw, mood_analysis, influence_zones, device):
-        """
-        Apply mood colors to make the image belong in that mood.
-        This function generates the full-strength (strength=1.0) version of the effect.
-        """
-        try:
-            check_for_interruption()
-            
-            main_color = mood_analysis['main_color']
-            temperature = mood_analysis['temperature']
-            brightness = mood_analysis['brightness']
+            mask_system = {'background_mask': background_mask}
             
             result = image_bchw.clone()
             
-            core_mask = influence_zones['core_mask']
-            edge_mask = influence_zones['edge_mask']
-            bg_mask = influence_zones['background_mask']
+            color_palette = preset_data.get("color_palette", {})
+            if color_palette:
+                result = self._apply_preset_color_grading(result, color_palette, image_analysis, mask_system)
             
-            # Define the maximum strength of the effect for different image zones.
-            # This creates the "gentle but visible" effect on the character.
-            core_strength = 0.35  # Increased from 0.15
-            edge_strength = 0.65  # Increased from 0.4
-            bg_strength = 0.95   # Increased from 0.8
+            temperature_shift = preset_data.get("temperature_shift", "none")
+            if temperature_shift != "none":
+                result = self._apply_preset_temperature(result, temperature_shift, image_analysis, mask_system)
             
-            # Create a single influence map from the zones and their strengths
-            color_influence = (core_mask * core_strength + 
-                                edge_mask * edge_strength + 
-                                bg_mask * bg_strength)
+            brightness_shift = preset_data.get("brightness_shift", "enhance_existing")
+            if brightness_shift != "enhance_existing":
+                result = self._apply_preset_brightness(result, brightness_shift, image_analysis, mask_system)
             
-            # Apply mood color tint
-            # We use a soft light blend for a more natural color transfer
-            mood_color_layer = main_color.view(1, 3, 1, 1).expand_as(result)
-            colored_image = self._soft_light_blend(result, mood_color_layer)
-            result = torch.lerp(result, colored_image, color_influence * 0.6)
+            atmospheric_effects = preset_data.get("atmospheric_effects", {})
+            if atmospheric_effects:
+                result = self._apply_preset_atmospheric_effects(result, atmospheric_effects, image_analysis, mask_system, scale_factor)
+            
+            result = self.apply_clipping_protection(result)
+            return result
+            
+        except Exception as e:
+            print(f"Error in full mood effects: {e}")
+            return image_bchw
 
-            # Apply temperature shift
-            if abs(temperature) > 0.05:
-                # Create a warm/cool filter based on temperature
-                temp_shift_color = torch.tensor([temperature, 0, -temperature], device=device).view(1, 3, 1, 1) * 0.5
-                # Apply with a soft overlay to avoid unnatural color casts
-                result = torch.lerp(result, torch.clamp(result + temp_shift_color, 0, 1), color_influence)
+    def _apply_reduced_mood_effects(self, image_bchw, preset_data, scale_factor, reduction_factor):
+      
+        try:
+            check_for_interruption()
+            
+            h, w = image_bchw.shape[-2:]
+            device = image_bchw.device
+            full_mask = torch.ones((1, 1, h, w), device=device)
+            
+            image_analysis = self._analyze_image_characteristics(image_bchw, full_mask, scale_factor)
+            mask_system = {'background_mask': full_mask}
+            
+            result = image_bchw.clone()
+            
+            color_palette = preset_data.get("color_palette", {})
+            if color_palette:
+                result = self._apply_preset_color_grading(result, color_palette, image_analysis, mask_system)
+            
+            temperature_shift = preset_data.get("temperature_shift", "none")
+            if temperature_shift != "none":
+                result = self._apply_preset_temperature(result, temperature_shift, image_analysis, mask_system)
+            
+            brightness_shift = preset_data.get("brightness_shift", "enhance_existing")
+            if brightness_shift != "enhance_existing":
+                result = self._apply_preset_brightness(result, brightness_shift, image_analysis, mask_system)
+            
+            
+            final_result = torch.lerp(image_bchw, result, reduction_factor)
+            
+            final_result = self.apply_clipping_protection(final_result)
+            return final_result
+            
+        except Exception as e:
+            print(f"Error in reduced mood effects: {e}")
+            return image_bchw    
+    def _create_simple_mask_system(self, subject_mask, scale_factor, device, depth_map):
+      
+        try:
+            check_for_interruption()
+            
+            h, w = subject_mask.shape[-2:]
+            
+            if subject_mask.device != device:
+                subject_mask = subject_mask.to(device)
+            
+            original_smooth_mask = torch.clamp(subject_mask, 0.0, 1.0)
+            
+            core_mask = torch.pow(original_smooth_mask, 1.5)
+            
+            soft_mask = original_smooth_mask
+            
+            if scale_factor > 1.0:
+                wide_blur = max(8.0 * scale_factor, 4.0)
+                wide_kernel = int(wide_blur * 2) | 1
+                wide_mask = kornia.filters.gaussian_blur2d(
+                    original_smooth_mask, (wide_kernel, wide_kernel), (wide_blur, wide_blur)
+                )
+            else:
+                wide_mask = original_smooth_mask
+            
+            background_mask = torch.clamp(1.0 - wide_mask, 0.0, 1.0)
+            
+            if depth_map is not None:
+                if depth_map.device != device:
+                    depth_map = depth_map.to(device)
+                if depth_map.shape[-2:] != (h, w):
+                    depth_map = F.interpolate(depth_map, size=(h, w), mode='bilinear', align_corners=False)
+                
+                depth_map = torch.clamp(depth_map, 0.0, 1.0)
+                
+                near_regions = depth_map.pow(1.8)
+                far_regions = (1.0 - depth_map).pow(1.2)
+                
+                depth_enhanced_core = core_mask * (0.9 + 0.1 * near_regions)
+                depth_enhanced_soft = soft_mask * (0.95 + 0.05 * near_regions)
+                
+            else:
+                depth_enhanced_core = core_mask
+                depth_enhanced_soft = soft_mask
+                near_regions = torch.ones_like(core_mask)
+                far_regions = torch.zeros_like(core_mask)
+            
+            return {
+                'core_mask': torch.clamp(depth_enhanced_core, 0.0, 1.0),
+                'soft_mask': torch.clamp(depth_enhanced_soft, 0.0, 1.0),
+                'background_mask': background_mask,
+                'near_regions': near_regions,
+                'far_regions': far_regions,
+                'wide_mask': wide_mask,
+                'original_mask': original_smooth_mask
+            }
+            
+        except Exception as e:
+            print(f"Error creating mask system: {e}")
+            safe_mask = torch.clamp(subject_mask, 0.0, 1.0)
+            return {
+                'core_mask': torch.pow(safe_mask, 1.5), 'soft_mask': safe_mask,
+                'background_mask': torch.clamp(1.0 - safe_mask, 0.0, 1.0), 
+                'wide_mask': safe_mask, 'original_mask': safe_mask,
+                'near_regions': torch.ones_like(safe_mask),
+                'far_regions': torch.zeros_like(safe_mask)
+            }
 
-            # Brightness matching
-            # This part can easily wash out details, so we keep it subtle
-            current_brightness = torch.mean(kornia.color.rgb_to_grayscale(result) * influence_zones['soft_subject_mask'])
-            if current_brightness > 0:
-                brightness_diff = brightness - current_brightness
-                # Apply brightness change gently, mostly to background
-                brightness_influence = (influence_zones['core_mask'] * 0.1 +
-                                        influence_zones['edge_mask'] * 0.2 +
-                                        influence_zones['background_mask'] * 0.8)
-                result = torch.clamp(result + (brightness_diff * brightness_influence), 0.0, 1.0)
+    def _merge_with_inward_feather(self, full_effect_image, foreground_50_image, mask_system):
+     
+        try:
+            check_for_interruption()
+            
+            soft_mask = mask_system['soft_mask']
+            
+            result = full_effect_image.clone()
+            
+            result = torch.lerp(result, foreground_50_image, soft_mask)
+            
+            
+            edge_threshold = 0.9
+            contaminated_edges = torch.clamp((edge_threshold - soft_mask) / edge_threshold, 0.0, 1.0)
+            contaminated_edges = contaminated_edges * soft_mask
+            
+            correction_strength = 0.6
+            
+            result = torch.lerp(result, full_effect_image, contaminated_edges * correction_strength)
             
             return torch.clamp(result, 0.0, 1.0)
             
-        except model_management.InterruptProcessingException:
-            raise
         except Exception as e:
-            print(f"Error in color grading: {e}")
-            return image_bchw
+            print(f"Error replacing edge artifacts: {e}")
+            return foreground_50_image
     
-    def _generate_procedural_light_map(self, background_bchw, device):
-        """
-        Analyzes the background to find the primary light source's location,
-        then generates a clean, procedural gradient map representing that light.
-        This avoids projecting the background's texture onto the foreground.
-        """
-        try:
-            h, w = background_bchw.shape[-2:]
-            
-            # 1. Find the brightest point in the background to use as a reference
-            bg_gray = kornia.color.rgb_to_grayscale(background_bchw)
-            # Find the index of the max value
-            brightest_index = torch.argmax(bg_gray)
-            # Convert the flat index to 2D coordinates
-            brightest_y = (brightest_index // w) / h
-            brightest_x = (brightest_index % w) / w
-
-            # 2. Create a coordinate grid
-            y_coords, x_coords = torch.meshgrid(
-                torch.linspace(0, 1, h, device=device),
-                torch.linspace(0, 1, w, device=device),
-                indexing='ij'
-            )
-
-            # 3. Calculate distance from every pixel to the brightest point
-            distance = torch.sqrt((x_coords - brightest_x)**2 + (y_coords - brightest_y)**2)
-            
-            # 4. Generate a smooth falloff gradient based on distance
-            falloff_radius = 0.75 # Controls the "size" of the light source
-            falloff_exponent = 1.5 # Controls the softness of the light's edge
-            light_map = 1.0 / (1.0 + (distance / falloff_radius).pow(falloff_exponent))
-            
-            return light_map.unsqueeze(0).unsqueeze(0)
-
-        except Exception as e:
-            print(f"Error generating procedural light map: {e}")
-            return torch.zeros((1, 1, h, w), device=device)
-    
-    def _suppress_spill(self, foreground_bchw, background_bchw, subject_mask, scale_factor):
-        """
-        Applies a definitive, distance-based spill suppression to create a seamless edge blend.
-        It neutralizes the character's edge and tints it with the local background color.
-        """
-        try:
-            # 1. Create a true, inward-fading distance map.
-            # We simulate a distance transform by heavily blurring the inside of the mask.
-            # The blur amount is dynamic and controls the thickness of the blend zone.
-            blend_thickness = max(8.0 * scale_factor, 4.0)
-            kernel_size = int(blend_thickness * 2) | 1
-            
-            # A big box blur is a fast and effective way to create a soft interior gradient
-            blurred_interior = kornia.filters.box_blur(subject_mask, (kernel_size, kernel_size))
-            
-            # The distance map is the difference, revealing a soft gradient from the edge inward.
-            distance_map = torch.clamp((subject_mask - blurred_interior) * 1.5, 0, 1)
-
-            if distance_map.max() == 0:
-                return foreground_bchw
-
-            # 2. Desaturate the foreground to create a neutral color base
-            fg_desaturated = kornia.color.rgb_to_grayscale(foreground_bchw).repeat(1, 3, 1, 1)
-            
-            # 3. Get the local background color to tint the edge with
-            ambient_edge_color = kornia.filters.gaussian_blur2d(background_bchw, (kernel_size, kernel_size), (blend_thickness, blend_thickness))
-
-            # 4. Perform the two-stage edge treatment
-            # First, neutralize the original edge color by blending towards the desaturated version
-            neutralized_fg = torch.lerp(foreground_bchw, fg_desaturated, distance_map)
-            # Second, tint that neutral edge with the new background's ambient color
-            tinted_fg = torch.lerp(neutralized_fg, ambient_edge_color, distance_map * 0.75) # *0.75 to keep it subtle
-            
-            # The final result is the original foreground, with only its edges replaced by the treated version
-            return torch.lerp(foreground_bchw, tinted_fg, distance_map)
-
-        except Exception as e:
-            print(f"Error in _suppress_spill: {e}")
-            return foreground_bchw
-    def apply_mood_and_lighting_transfer(self, image_bchw, subject_mask, mood_image, strength, mood_background_replace):
-        """
-        Applies a definitive, multi-stage mood and lighting transfer that correctly
-        grades the background and integrates the foreground for a final, professional result.
-        """
+    def _analyze_image_characteristics(self, image_bchw, subject_mask, scale_factor, generated_mood_type=None):
+      
         try:
             check_for_interruption()
+            
+            image_lab = kornia.color.rgb_to_lab(image_bchw)
+            l_channel = image_lab[:, 0:1] / 100.0
+            a_channel = image_lab[:, 1:2]
+            b_channel = image_lab[:, 2:3]
+            
+            overall_brightness = torch.mean(l_channel)
+            overall_contrast = torch.std(l_channel)
+            color_temp = torch.mean(b_channel) / 100.0
+            
+            blur_radius = max(8.0 * scale_factor, 4.0)
+            kernel_size = int(blur_radius * 2) | 1
+            blurred_l = kornia.filters.gaussian_blur2d(
+                l_channel, (kernel_size, kernel_size), (blur_radius, blur_radius)
+            )
+            
+            highlight_threshold = torch.quantile(blurred_l.flatten(), 0.85)
+            highlight_mask = torch.clamp((blurred_l - highlight_threshold) / (1.0 - highlight_threshold), 0, 1)
+
+            highlight_intensity = torch.mean(blurred_l[highlight_mask > 0.1]) if torch.sum(highlight_mask) > 0.1 else 0.5
+            
+            shadow_threshold = torch.quantile(blurred_l.flatten(), 0.25)
+            shadow_mask = (blurred_l < shadow_threshold).float()
+            shadow_depth = torch.mean(blurred_l[shadow_mask > 0.5]) if torch.sum(shadow_mask) > 0 else 0.3
+            
+            background_mask = 1.0 - subject_mask
+            if torch.sum(background_mask) > 0:
+                bg_brightness = torch.mean(l_channel[background_mask > 0.5])
+            else:
+                bg_brightness = overall_brightness
+            
+            if torch.sum(subject_mask) > 0:
+                fg_brightness = torch.mean(l_channel[subject_mask > 0.5])
+                fg_contrast = torch.std(l_channel[subject_mask > 0.5])
+            else:
+                fg_brightness = overall_brightness
+                fg_contrast = overall_contrast
+
+            analysis_result = {
+                'overall_brightness': overall_brightness.item(),
+                'overall_contrast': overall_contrast.item(),
+                'color_temperature': color_temp.item(),
+                'highlight_intensity': highlight_intensity.item() if isinstance(highlight_intensity, torch.Tensor) else highlight_intensity,
+                'shadow_depth': shadow_depth.item() if isinstance(shadow_depth, torch.Tensor) else shadow_depth,
+                'bg_brightness': bg_brightness.item(),
+                'fg_brightness': fg_brightness.item(),
+                'fg_contrast': fg_contrast.item(),
+                'highlight_mask': highlight_mask,
+                'shadow_mask': shadow_mask,
+                'is_bright_image': overall_brightness > 0.6,
+                'is_dark_image': overall_brightness < 0.3,
+                'is_high_contrast': overall_contrast > 0.25,
+                'is_warm': color_temp > 0.1,
+                'is_cool': color_temp < -0.1,
+                'scale_factor': scale_factor
+            }
+            if generated_mood_type:
+                analysis_result['mood_type'] = generated_mood_type
+            
+            return analysis_result
+            
+        except Exception as e:
+            print(f"Error in image analysis: {e}")
+            return self._get_default_analysis(scale_factor)
+
+    def _get_default_analysis(self, scale_factor):
+        
+        device = torch.device('cpu')
+        return {
+            'overall_brightness': 0.5, 'overall_contrast': 0.2, 'color_temperature': 0.0,
+            'highlight_intensity': 0.7, 'shadow_depth': 0.3, 'bg_brightness': 0.5,
+            'bg_highlight_ratio': 0.1, 'fg_brightness': 0.5, 'fg_contrast': 0.2,
+            'highlight_mask': torch.zeros((1, 1, 64, 64), device=device),
+            'shadow_mask': torch.zeros((1, 1, 64, 64), device=device),
+            'is_bright_image': False, 'is_dark_image': False, 'is_high_contrast': False,
+            'is_warm': False, 'is_cool': False, 'scale_factor': scale_factor
+        }
+    
+    
+    def _apply_preset_brightness(self, image_bchw, brightness_shift, image_analysis, mask_system):
+     
+        try:
+            check_for_interruption()
+            background_mask = mask_system['background_mask']
+            
+            adjustment = 0.0
+            if isinstance(brightness_shift, str):
+                shift_mapping = {"slightly_moodier": -8.0, "much_darker": -18.0, "moodier": -12.0, "darker_but_vibrant": -10.0}
+                adjustment = shift_mapping.get(brightness_shift, 0.0)
+            elif isinstance(brightness_shift, (int, float)):
+                adjustment = brightness_shift
+
+            if adjustment == 0.0:
+                return image_bchw
+            
+            image_lab = kornia.color.rgb_to_lab(image_bchw)
+            l_channel = image_lab[:, 0:1]
+            l_normalized = l_channel / 100.0
+            protection_curve = 4.0 * l_normalized * (1.0 - l_normalized)
+            l_adjusted = l_channel + (adjustment * background_mask * protection_curve)
+            adjusted_lab = torch.cat([l_adjusted, image_lab[:, 1:3]], dim=1)
+            adjusted_rgb = kornia.color.lab_to_rgb(adjusted_lab)
+            return torch.clamp(adjusted_rgb, 0.0, 1.0)
+            
+        except Exception as e:
+            print(f"Error in preset brightness: {e}")
+            return image_bchw
+
+    def _apply_preset_atmospheric_effects(self, image_bchw, atmospheric_effects, image_analysis, mask_system, scale_factor):
+     
+        try:
+            check_for_interruption()
+            
+            effect_type = atmospheric_effects.get("type", "clean_natural")
+            glow_colors = atmospheric_effects.get("glow_colors", [])
+            complex_glows = atmospheric_effects.get("complex_glows", False)
+            
+            intensity_multiplier = atmospheric_effects.get("intensity_multiplier", 1.0)
+            saturation_boost = atmospheric_effects.get("saturation_boost", 1.0)
+            coverage_multiplier = atmospheric_effects.get("coverage_multiplier", 1.0)
+            
+            if not glow_colors:
+                return image_bchw
+            
+            result = image_bchw.clone()
             device = image_bchw.device
             h, w = image_bchw.shape[-2:]
-            scale_factor = min(h, w) / 1024.0
-            original_image_bchw = image_bchw.clone()
-
-            if mood_image.dim() == 3: 
-                mood_image = mood_image.unsqueeze(0)
-            mood_image_bchw_orig = mood_image.permute(0, 3, 1, 2).to(device)
+            background_mask = mask_system['background_mask']
             
-            # --- Stage 1: Advanced Scene & Mood Analysis ---
-            mood_analysis_image = self._create_mood_background(mood_image_bchw_orig, h, w)
-            mood_palette = self._analyze_mood_image(mood_analysis_image, device)
+            highlight_mask = image_analysis['highlight_mask'].to(device)
+            bg_highlights = highlight_mask * background_mask
             
-            # --- Stage 2: Background Plate Preparation (LOGIC FIX) ---
-            # This is the critical change. We now correctly prepare the background plate
-            # that will be used in the final composite.
-            if mood_background_replace:
-                background_plate = mood_analysis_image
-            else:
-                # When not replacing, the plate IS the color-graded original background.
-                # This ensures the background always shifts to match the mood.
-                background_plate = self._blend_color_lab(original_image_bchw, mood_palette['main_color'], 0.8)
-
-            # --- Stage 3: Photographic Foreground Relighting ---
-            # The foreground is always relit based on the original character image.
-            relit_foreground = original_image_bchw.clone()
-
-            fg_luminance = kornia.color.rgb_to_grayscale(relit_foreground)
-            highlight_map = fg_luminance.pow(2.5) * subject_mask
-            shadow_map = (1.0 - fg_luminance).pow(2.5) * subject_mask
-            procedural_light_map = self._generate_procedural_light_map(background_plate, device)
-
-            relit_foreground = self._blend_color_lab(relit_foreground, mood_palette['main_color'], 0.3)
+            image_lab = kornia.color.rgb_to_lab(image_bchw)
+            l_channel = image_lab[:, 0:1]
+            l_normalized = l_channel / 100.0
             
-            shadow_color_layer = mood_palette['shadow_color'].view(1, 3, 1, 1).expand_as(relit_foreground)
-            tinted_shadows = self._soft_light_blend(relit_foreground, shadow_color_layer)
-            relit_foreground = torch.lerp(relit_foreground, tinted_shadows, shadow_map * 0.75)
-
-            highlight_color_layer = mood_palette['accent_color'].view(1, 3, 1, 1).expand_as(relit_foreground)
-            tinted_highlights = self._soft_light_blend(relit_foreground, highlight_color_layer)
-            relit_foreground = torch.lerp(relit_foreground, tinted_highlights, (highlight_map * procedural_light_map) * 0.85)
+            deep_shadow_threshold = 0.15
             
-            # --- Stage 4: Spill Suppression & Final Composite (LOGIC FIX) ---
-            spill_suppressed_foreground = self._suppress_spill(relit_foreground, background_plate, subject_mask, scale_factor)
+            deep_shadow_protection_map = torch.clamp(1.0 - (l_normalized / deep_shadow_threshold), 0.0, 1.0)
 
-            feather_amount = max(2.0 * scale_factor, 1.0)
-            kernel_size = int(feather_amount * 2) | 1
-            soft_mask = kornia.filters.gaussian_blur2d(subject_mask, (kernel_size, kernel_size), (feather_amount, feather_amount))
-            final_compositing_mask = torch.max(subject_mask, soft_mask)
-
-            # The composite is now correctly built using the prepared background_plate.
-            final_image_processed = torch.lerp(background_plate, spill_suppressed_foreground, final_compositing_mask)
-
-            # --- Stage 5: Final Blend ---
-            # If the background was replaced, we blend from the original image to the new composite.
-            # If the background was graded, we also blend from the original to the new composite.
-            # This behavior is correct and consistent.
-            final_strength = pow(strength, 1.2)
-            result = torch.lerp(original_image_bchw, final_image_processed, final_strength)
+            final_glow_application_mask = background_mask * (1.0 - deep_shadow_protection_map)
             
-            return torch.clamp(result, 0.0, 1.0)
+            
+            if effect_type == "clean_natural":
+                for i, glow_color in enumerate(glow_colors):
+                    result = self._apply_natural_glow_from_preset(
+                        result, glow_color, bg_highlights, final_glow_application_mask, scale_factor, i
+                    )
+                    
+            elif effect_type == "warm_cinematic":
+                for i, glow_color in enumerate(glow_colors):
+                    result = self._apply_cinematic_glow_from_preset(
+                        result, glow_color, bg_highlights, final_glow_application_mask, scale_factor, i
+                    )
+                    
+            elif effect_type == "mysterious_cool":
+                for i, glow_color in enumerate(glow_colors):
+                    result = self._apply_cool_glow_from_preset(
+                        result, glow_color, bg_highlights, final_glow_application_mask, scale_factor, i
+                    )
+                    
+            elif effect_type == "cyberpunk_complex" and complex_glows:
+                h, w = image_bchw.shape[-2:]
+                device = image_bchw.device
+                atmospheric_depth = self._create_atmospheric_depth_map(
+                    image_analysis, mask_system, scale_factor, device, h, w
+                )
+                result = self._apply_cyberpunk_atmospheric_effects(
+                    result, glow_colors, atmospheric_depth, {'background_mask': final_glow_application_mask}, scale_factor, image_analysis,
+                    intensity_multiplier, saturation_boost, coverage_multiplier
+                )
+            
+            result = self.apply_clipping_protection(result)
+            return result
 
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error applying mood and lighting transfer: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error in preset atmospheric effects: {e}")
+
             return image_bchw
-    def _construct_lit_foreground(self, original_bchw, subject_mask, ambient_color, highlight_color, lighting_map, scale_factor):
-        """
-        Applies bounce and rim light using a Screen blend and then correctly transfers
-        the resulting hue to the character using the LAB color space.
-        """
-        device = original_bchw.device
-        
-        relit_reference = original_bchw.clone()
-
-        bounce_light_effect = torch.lerp(ambient_color, highlight_color, lighting_map) * 0.7
-        relit_reference = 1.0 - (1.0 - relit_reference) * (1.0 - bounce_light_effect)
-
-        edge_kernel_size = max(3, int(3 * scale_factor) | 1)
-        edge_mask = kornia.morphology.gradient(subject_mask, torch.ones(edge_kernel_size, edge_kernel_size, device=device))
-        rim_blur_radius = max(6.0 * scale_factor, 3.0)
-        rim_kernel_size = int(rim_blur_radius * 2) | 1
-        soft_rim_mask = kornia.filters.gaussian_blur2d(edge_mask, (rim_kernel_size, rim_kernel_size), (rim_blur_radius, rim_blur_radius))
-        rim_light_effect = soft_rim_mask * highlight_color * 1.2
-        relit_reference = 1.0 - (1.0 - relit_reference) * (1.0 - rim_light_effect)
-        
-        original_lab = kornia.color.rgb_to_lab(original_bchw)
-        relit_lab = kornia.color.rgb_to_lab(relit_reference)
-        
-        final_lab = torch.cat([original_lab[:, 0:1, :, :], relit_lab[:, 1:3, :, :]], dim=1)
-        
-        return kornia.color.lab_to_rgb(final_lab)
-
-    def _apply_highlight_glow(self, original_bchw, background, foreground, highlight_color, scale_factor):
-        """Finds highlights in the original image and applies a colored glow."""
-        original_gray = kornia.color.rgb_to_grayscale(original_bchw)
-        highlight_mask = torch.clamp((original_gray - 0.85) / 0.15, 0, 1)
-        glow_blur = max(8.0 * scale_factor, 4.0)
-        glow_kernel = int(glow_blur * 2) | 1
-        soft_highlight_mask = kornia.filters.gaussian_blur2d(highlight_mask, (glow_kernel, glow_kernel), (glow_blur, glow_blur))
-        glow_effect = soft_highlight_mask * highlight_color
-        
-        background = 1.0 - (1.0 - background) * (1.0 - glow_effect * 0.8)
-        foreground = 1.0 - (1.0 - foreground) * (1.0 - glow_effect * 0.4)
-        return background, foreground
-    def _create_mood_background(self, mood_image_bchw, target_h, target_w):
-        """
-        Performs a high-quality, aspect-ratio-preserving 'cover' resize of the
-        mood image to be used as a replacement background.
-        """
-        mood_h, mood_w = mood_image_bchw.shape[-2:]
-        
-        mood_aspect = mood_w / mood_h
-        target_aspect = target_w / target_h
-        
-        if mood_aspect > target_aspect:
-            new_h = target_h
-            new_w = int(target_h * mood_aspect)
-        else:
-            new_w = target_w
-            new_h = int(target_w / mood_aspect)
+    
+    def _apply_natural_glow_from_preset(self, image_bchw, glow_color, bg_highlights, background_mask, scale_factor, layer_index):
+  
+        try:
+            check_for_interruption()
             
-        interp_mode = 'area' if (new_w * new_h) < (mood_w * mood_h) else 'bicubic'
-        resized_mood = F.interpolate(mood_image_bchw, size=(new_h, new_w), mode=interp_mode)
-        
-        y_offset = (new_h - target_h) // 2
-        x_offset = (new_w - target_w) // 2
-        return resized_mood[:, :, y_offset:y_offset+target_h, x_offset:x_offset+target_w]    
+            device = image_bchw.device
+            
+            glow_radius = max(40.0 * scale_factor, 20.0) * (1.0 + layer_index * 0.2)
+            kernel_size = int(glow_radius * 2) | 1
+            
+            natural_glow = kornia.filters.gaussian_blur2d(
+                bg_highlights, (kernel_size, kernel_size), (glow_radius, glow_radius)
+            )
+            
+            glow_strength = 0.35 * (0.8 ** layer_index)
+            glow_color_tensor = torch.tensor(glow_color, device=device).view(1, 3, 1, 1)
+            
+            glow_effect = natural_glow * glow_color_tensor * glow_strength
+            result = image_bchw + glow_effect * background_mask
+            
+            return torch.clamp(result, 0.0, 1.0)
+            
+        except Exception as e:
+            print(f"Error in natural glow from preset: {e}")
+            return image_bchw
+
+    def _apply_cinematic_glow_from_preset(self, image_bchw, glow_color, bg_highlights, background_mask, scale_factor, layer_index):
+ 
+        try:
+            check_for_interruption()
+            
+            device = image_bchw.device
+            
+            glow_radius = max(30.0 * scale_factor, 15.0) * (1.0 + layer_index * 0.3)
+            kernel_size = int(glow_radius * 2) | 1
+            
+            cinematic_glow = kornia.filters.gaussian_blur2d(
+                bg_highlights, (kernel_size, kernel_size), (glow_radius, glow_radius)
+            )
+            
+            glow_strength = 0.4 * (0.7 ** layer_index)
+            glow_color_tensor = torch.tensor(glow_color, device=device).view(1, 3, 1, 1)
+            
+            glow_layer = cinematic_glow * glow_color_tensor * glow_strength
+            glowed_image = 1.0 - (1.0 - image_bchw) * (1.0 - glow_layer)
+            
+            final_mask = cinematic_glow * glow_strength * background_mask
+            result = torch.lerp(image_bchw, glowed_image, final_mask)
+            
+            return torch.clamp(result, 0.0, 1.0)
+            
+        except Exception as e:
+            print(f"Error in cinematic glow from preset: {e}")
+            return image_bchw
+
+    def _apply_cool_glow_from_preset(self, image_bchw, glow_color, bg_highlights, background_mask, scale_factor, layer_index):
+   
+        try:
+            check_for_interruption()
+            
+            device = image_bchw.device
+            
+            glow_radius = max(25.0 * scale_factor, 12.0) * (1.0 + layer_index * 0.3)
+            kernel_size = int(glow_radius * 2) | 1
+            
+            gray = kornia.color.rgb_to_grayscale(image_bchw)
+            edges = kornia.filters.sobel(gray)
+            edge_enhanced_highlights = bg_highlights * (0.8 + 0.2 * torch.tanh(edges * 2.0))
+            
+            cool_glow = kornia.filters.gaussian_blur2d(
+                edge_enhanced_highlights, (kernel_size, kernel_size), (glow_radius, glow_radius)
+            )
+            
+            glow_strength = 0.35 * (0.75 ** layer_index)
+            glow_color_tensor = torch.tensor(glow_color, device=device).view(1, 3, 1, 1)
+            
+            image_lab = kornia.color.rgb_to_lab(image_bchw)
+            glow_lab = kornia.color.rgb_to_lab(glow_color_tensor.expand_as(image_bchw))
+            
+            glow_mask = cool_glow * glow_strength * background_mask
+            enhanced_lab = torch.cat([
+                image_lab[:, 0:1],
+                torch.lerp(image_lab[:, 1:2], glow_lab[:, 1:2], glow_mask * 0.6),
+                torch.lerp(image_lab[:, 2:3], glow_lab[:, 2:3], glow_mask * 0.6)
+            ], dim=1)
+            
+            result = kornia.color.lab_to_rgb(enhanced_lab)
+            return torch.clamp(result, 0.0, 1.0)
+            
+        except Exception as e:
+            print(f"Error in cool glow from preset: {e}")
+            return image_bchw
+
+    def _apply_cyberpunk_atmospheric_effects(self, image_bchw, glow_colors, atmospheric_depth, mask_system, scale_factor, image_analysis, intensity_multiplier=1.0, saturation_boost=1.0, coverage_multiplier=1.0):
+      
+        try:
+            check_for_interruption()
+            
+            device = image_bchw.device
+            result = image_bchw.clone()
+            background_mask = mask_system['background_mask']
+            
+            for i, glow_color in enumerate(glow_colors):
+                
+                base_radius = max(15.0 * scale_factor, 8.0)
+                layer_radius = base_radius * (0.8 + i * 0.3)
+                
+                h, w = atmospheric_depth.shape[-2:]
+                y_coords, x_coords = torch.meshgrid(
+                    torch.linspace(0, 1, h, device=device),
+                    torch.linspace(0, 1, w, device=device),
+                    indexing='ij'
+                )
+                
+                intensity_variation = (
+                    torch.sin(x_coords * 3.14159 * 2) * 0.3 + 
+                    torch.cos(y_coords * 3.14159 * 1.5) * 0.2 + 
+                    0.5
+                ).unsqueeze(0).unsqueeze(0)
+                
+                cyberpunk_depth = atmospheric_depth * intensity_variation
+                
+                kernel_size = int(layer_radius * 2) | 1
+                cyberpunk_glow = kornia.filters.gaussian_blur2d(
+                    cyberpunk_depth, (kernel_size, kernel_size), (layer_radius, layer_radius)
+                )
+                
+                base_glow_strength = 0.4 * (0.6 ** i) * intensity_multiplier
+                if image_analysis['is_dark_image']:
+                    base_glow_strength *= 1.4
+
+                glow_color_tensor = torch.tensor(glow_color, device=device).view(1, 3, 1, 1)
+
+                if saturation_boost > 1.0:
+                    glow_color_hsv = self._rgb_to_hsv_simple(glow_color_tensor)
+                    glow_color_hsv[:, 1:2] = torch.clamp(glow_color_hsv[:, 1:2] * saturation_boost, 0.0, 1.0)
+                    glow_color_tensor = self._hsv_to_rgb_simple(glow_color_hsv)
+
+                glow_layer = cyberpunk_glow * glow_color_tensor * base_glow_strength
+                glowed_image = 1.0 - (1.0 - result) * (1.0 - glow_layer)
+
+                expanded_glow = torch.clamp(cyberpunk_glow * coverage_multiplier, 0.0, 1.0)
+                glow_mask = torch.clamp(expanded_glow * base_glow_strength, 0.0, 1.0) * background_mask
+                result = torch.lerp(result, glowed_image, glow_mask)
+            
+            result = self._add_cyberpunk_edge_effects(result, mask_system, scale_factor, glow_colors[0] if glow_colors else [1.0, 0.2, 0.8])
+            
+            return torch.clamp(result, 0.0, 1.0)
+            
+        except Exception as e:
+            print(f"Error in cyberpunk atmospheric effects: {e}")
+            return image_bchw
+
+    def _add_cyberpunk_edge_effects(self, image_bchw, mask_system, scale_factor, primary_color):
+    
+        try:
+            check_for_interruption()
+            
+            device = image_bchw.device
+            background_mask = mask_system['background_mask']
+            
+            gray = kornia.color.rgb_to_grayscale(image_bchw)
+            edges = kornia.filters.sobel(gray)
+            
+            edge_radius = max(3.0 * scale_factor, 2.0)
+            kernel_size = int(edge_radius * 2) | 1
+            soft_edges = kornia.filters.gaussian_blur2d(
+                edges, (kernel_size, kernel_size), (edge_radius, edge_radius)
+            )
+            
+            edge_strength = 0.15
+            edge_color_tensor = torch.tensor(primary_color, device=device).view(1, 3, 1, 1)
+            
+            edge_glow = soft_edges * edge_color_tensor * edge_strength * background_mask
+            edge_enhanced = 1.0 - (1.0 - image_bchw) * (1.0 - edge_glow)
+            
+            edge_mask = torch.clamp(soft_edges * edge_strength, 0.0, 0.3) * background_mask
+            result = torch.lerp(image_bchw, edge_enhanced, edge_mask)
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error adding cyberpunk edge effects: {e}")
+            return image_bchw
+    
+    def _apply_preset_color_grading(self, image_bchw, color_palette, image_analysis, mask_system):
+   
+        try:
+            check_for_interruption()
+            
+            background_mask = mask_system['background_mask']
+            
+            highlight_tint = color_palette.get("highlight_tint")
+            shadow_tint = color_palette.get("shadow_tint")
+            accent_colors = color_palette.get("accent_colors", [])
+            
+            image_lab = kornia.color.rgb_to_lab(image_bchw)
+            l_channel = image_lab[:, 0:1]
+            l_normalized = l_channel / 100.0
+            
+            tint_strength = 0.8 if image_analysis.get('is_high_contrast', False) else 1.0
+            
+            result = image_bchw.clone()
+
+            if highlight_tint:
+                highlight_regions = torch.pow(l_normalized, 0.6)
+                highlight_mask = highlight_regions * background_mask * tint_strength * 0.7
+                result = self._tint_in_lab(result, highlight_tint, highlight_mask)
+
+            if shadow_tint:
+                shadow_regions = torch.pow(1.0 - l_normalized, 1.0)
+                shadow_mask = shadow_regions * background_mask * tint_strength * 0.6
+                result = self._tint_in_lab(result, shadow_tint, shadow_mask)
+
+            mood_type = image_analysis.get('mood_type', 'bright_natural')
+            if mood_type in ["cyberpunk_vibrant", "warm_cinematic"] and accent_colors:
+                midtone_regions = torch.exp(-((l_normalized - 0.5) / 0.3)**2)
+                
+                accent_mask = midtone_regions * background_mask * tint_strength * 0.3
+                result = self._tint_in_lab(result, accent_colors[0], accent_mask)
+            
+            return torch.clamp(result, 0.0, 1.0)
+            
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            print(f"Error in preset color grading: {e}")
+
+            return image_bchw
+
+    def _apply_preset_temperature(self, image_bchw, temperature_shift, image_analysis, mask_system):
+     
+        try:
+            check_for_interruption()
+            background_mask = mask_system['background_mask']
+            
+            shift_amount = 0.0
+            if isinstance(temperature_shift, str):
+                shift_mapping = {"slightly_cooler": -15.0, "much_cooler": -30.0, "cooler": -22.0, 
+                                    "slightly_warmer": 15.0, "much_warmer": 30.0, "warmer": 22.0}
+                shift_amount = shift_mapping.get(temperature_shift, 0.0)
+            elif isinstance(temperature_shift, (int, float)):
+                shift_amount = temperature_shift
+
+            if shift_amount == 0.0:
+                return image_bchw
+            
+            image_lab = kornia.color.rgb_to_lab(image_bchw)
+            b_channel = image_lab[:, 2:3]
+            b_adjusted = b_channel + (shift_amount * background_mask)
+            shifted_lab = torch.cat([image_lab[:, 0:2], b_adjusted], dim=1)
+            shifted_rgb = kornia.color.lab_to_rgb(shifted_lab)
+            return torch.clamp(shifted_rgb, 0.0, 1.0)
+            
+        except Exception as e:
+            print(f"Error in preset temperature: {e}")
+            return image_bchw
+   
+    def _create_atmospheric_depth_map(self, image_analysis, mask_system, scale_factor, device, h, w):
+   
+        try:
+            if 'far_regions' in mask_system and torch.sum(mask_system['far_regions']) > 0:
+                atmospheric_depth = mask_system['far_regions'].clone()
+            else:
+                y_coords, x_coords = torch.meshgrid(
+                    torch.linspace(0, 1, h, device=device),
+                    torch.linspace(0, 1, w, device=device),
+                    indexing='ij'
+                )
+                
+                center_distance = torch.sqrt((x_coords - 0.5)**2 + (y_coords - 0.5)**2)
+                atmospheric_depth = torch.clamp(center_distance * 1.5, 0, 1).unsqueeze(0).unsqueeze(0)
+            
+            brightness_map = image_analysis['highlight_mask'] * 0.3 + image_analysis['shadow_mask'] * 0.7
+            atmospheric_depth = atmospheric_depth * (0.7 + 0.3 * brightness_map)
+            
+            atmospheric_depth = atmospheric_depth * mask_system['background_mask']
+            
+            return atmospheric_depth
+            
+        except Exception as e:
+            print(f"Error creating atmospheric depth map: {e}")
+            return torch.zeros((1, 1, h, w), device=device)
+    
+    def _rgb_to_hsv_simple(self, rgb_tensor):
+     
+        try:
+            r, g, b = rgb_tensor[:, 0:1], rgb_tensor[:, 1:2], rgb_tensor[:, 2:3]
+            
+            max_val = torch.max(torch.max(r, g), b)
+            min_val = torch.min(torch.min(r, g), b)
+            diff = max_val - min_val
+            
+            v = max_val
+            
+            s = torch.where(max_val > 1e-8, diff / max_val, torch.zeros_like(max_val))
+            
+            h = torch.zeros_like(diff)
+            red_mask = (max_val == r) & (diff > 1e-8)
+            h = torch.where(red_mask, (g - b) / (diff + 1e-8), h)
+            green_mask = (max_val == g) & (diff > 1e-8)
+            h = torch.where(green_mask, 2.0 + (b - r) / (diff + 1e-8), h)
+            blue_mask = (max_val == b) & (diff > 1e-8)
+            h = torch.where(blue_mask, 4.0 + (r - g) / (diff + 1e-8), h)
+            
+            h = h / 6.0
+            h = torch.where(h < 0, h + 1.0, h)
+            
+            return torch.cat([h, s, v], dim=1)
+        except Exception as e:
+            print(f"Error in RGB to HSV: {e}")
+            return rgb_tensor
+
+    def _hsv_to_rgb_simple(self, hsv_tensor):
+       
+        try:
+            h, s, v = hsv_tensor[:, 0:1], hsv_tensor[:, 1:2], hsv_tensor[:, 2:3]
+            
+            c = v * s
+            h_prime = h * 6.0
+            x = c * (1.0 - torch.abs((h_prime % 2.0) - 1.0))
+            m = v - c
+            
+            r = torch.zeros_like(h)
+            g = torch.zeros_like(h)
+            b = torch.zeros_like(h)
+            
+            mask0 = (h_prime >= 0) & (h_prime < 1)
+            r = torch.where(mask0, c, r)
+            g = torch.where(mask0, x, g)
+            
+            mask1 = (h_prime >= 1) & (h_prime < 2)
+            r = torch.where(mask1, x, r)
+            g = torch.where(mask1, c, g)
+            
+            mask2 = (h_prime >= 2) & (h_prime < 3)
+            g = torch.where(mask2, c, g)
+            b = torch.where(mask2, x, b)
+            
+            mask3 = (h_prime >= 3) & (h_prime < 4)
+            g = torch.where(mask3, x, g)
+            b = torch.where(mask3, c, b)
+            
+            mask4 = (h_prime >= 4) & (h_prime < 5)
+            r = torch.where(mask4, x, r)
+            b = torch.where(mask4, c, b)
+            
+            mask5 = (h_prime >= 5) & (h_prime < 6)
+            r = torch.where(mask5, c, r)
+            b = torch.where(mask5, x, b)
+            
+            return torch.cat([r + m, g + m, b + m], dim=1)
+        except Exception as e:
+            print(f"Error in HSV to RGB: {e}")
+            return hsv_tensor
+    
     def get_mask_bounding_box(self, mask):
-        """Finds the bounding box of the non-zero regions in a mask tensor."""
+       
         if mask.sum() == 0:
             return 0, 0, mask.shape[3], mask.shape[2]
         
@@ -752,121 +1889,64 @@ class LatentRefiner:
         
         return x_min.item(), y_min.item(), x_max.item(), y_max.item()
    
-    def _apply_dof_pyramid(self, image_bchw, subject_mask, dof_strength, device):
-        """
-        Internal helper to apply the high-quality, pyramid-based depth of field effect.
-        """
-        h, w = image_bchw.shape[-2:]
-        scale_factor = min(h, w) / 1024.0
-        
-        contract_k = torch.ones(max(1, int(3*scale_factor))*2+1, max(1, int(3*scale_factor))*2+1, device=device)
-        eroded_mask = kornia.morphology.erosion(subject_mask, contract_k)
-        
-        map_blur = (dof_strength * 1.5 + 2.0) * scale_factor
-        blur_map = torch.pow(1.0 - kornia.filters.gaussian_blur2d(eroded_mask, (int(map_blur*2)|1, int(map_blur*2)|1), (map_blur, map_blur)), 3.0)
-        
-        num_levels = 4
-        pyramid = [image_bchw]
-        for i in range(1, num_levels):
-            level_strength = (dof_strength * scale_factor) * (i / (num_levels - 1))
-            k_size = int(level_strength*2)|1
-            if k_size < 3: pyramid.append(image_bchw)
-            else: pyramid.append(kornia.filters.gaussian_blur2d(image_bchw, (k_size, k_size), (level_strength, level_strength)))
-        
-        scaled_map = blur_map * (num_levels - 1)
-        background = pyramid[0]
-        for i in range(num_levels - 1):
-            background = torch.lerp(background, pyramid[i+1], torch.clamp(scaled_map - i, 0.0, 1.0))
-            
-        return background
-    def _soft_light_blend(self, bottom, top):
-        """
-        Applies a Soft Light blend mode between two tensors.
-        The tensors are expected to be in the range [0, 1].
-        """
-        return torch.where(top > 0.5,
-                            1.0 - (1.0 - 2.0 * (top - 0.5)) * (1.0 - bottom),
-                            2.0 * top * bottom)
-    def apply_segmentation_effects(self, image_tensor, operating_mode, enable_dof, dof_strength, relighting_mode, relight_strength, mood_image, mood_strength, mood_background_replace):
-        """
-        Orchestrates segmentation-based effects, now passing the mood_background_replace toggle.
-        """
+
+    def _apply_dof_pyramid(self, image_bchw, subject_mask, depth_map, dof_strength, device):
+  
         try:
             check_for_interruption()
 
-            if not enable_dof and relighting_mode == "Disabled" and (mood_image is None or mood_strength <= 0):
-                return image_tensor
+            if depth_map is None or subject_mask is None:
+                print("Refiner: DOF skipped, missing depth map or subject mask.")
+                return image_bchw
 
-            if self.remover is None:
-                print("Initializing transparent-background remover (InspyreNet)...")
-                try:
-                    from transparent_background import Remover
-                    self.remover = Remover(mode='base', jit=False)
-                except Exception as e:
-                    print(f"Failed to initialize transparent-background remover: {e}")
-                    print("Segmentation-based effects (Relighting, DoF, Mood) will be skipped.")
-                    return image_tensor
-
-            device = image_tensor.device
-            h, w = image_tensor.shape[1], image_tensor.shape[2]
-            image_bchw = image_tensor.permute(0, 3, 1, 2)
+            background_area_mask = 1.0 - subject_mask
+            background_plate_with_hole = image_bchw * background_area_mask
+            bleed_radius = max(5.0, dof_strength * 2.0)
+            k_size_bleed = int(bleed_radius * 2) | 1
+            image_for_bleed = kornia.filters.gaussian_blur2d(image_bchw, (k_size_bleed, k_size_bleed), (bleed_radius, bleed_radius))
+            inpainted_background = torch.lerp(image_for_bleed, background_plate_with_hole, background_area_mask)
             
-            img_np = (image_tensor[0].cpu().numpy() * 255).astype(np.uint8)
-            pil_image = Image.fromarray(img_np)
-            mask_pil = self.remover.process(pil_image, type='map')
-            if mask_pil.mode != 'L': mask_pil = mask_pil.convert('L')
-            mask_np = np.array(mask_pil).astype(np.float32) / 255.0
-            
-            subject_mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
-            
-            if mood_image is not None and mood_strength > 0:
-                print(f"Refiner: Applying Mood & Lighting Transfer (Mode: {'Replace' if mood_background_replace else 'Relight'})")
-                image_bchw = self.apply_mood_and_lighting_transfer(image_bchw, subject_mask, mood_image, mood_strength, mood_background_replace)
-                check_for_interruption()
-
-            feather_amount = max(1.0, (min(h, w) / 512.0) * 2.0)
-            kernel_size = int(feather_amount * 2) | 1
-            compositing_mask = kornia.filters.gaussian_blur2d(subject_mask, (kernel_size, kernel_size), (feather_amount, feather_amount))
-            
-            sharp_foreground = image_bchw
-            background = image_bchw
-
-            if relighting_mode != "Disabled" and relight_strength > 0:
-                if subject_mask.sum() > 0:
-                    if relighting_mode == "Additive (Simple)":
-                        sharp_foreground = self.apply_professional_relighting(image_bchw, compositing_mask, relight_strength * 0.4, device)
-                    elif relighting_mode == "Corrective":
-                        if operating_mode == "Anime":
-                            sharp_foreground = self.apply_correction_anime(image_bchw, compositing_mask, relight_strength * 0.7, h, w)
-                        else:
-                            sharp_foreground = self.apply_correction_photo(image_bchw, compositing_mask, relight_strength)
+            num_levels = 4
+            blur_map = (1.0 - depth_map)
+            pyramid = [inpainted_background]
+            for i in range(1, num_levels):
+                level_strength = (dof_strength * 2.0) * (i / (num_levels - 1))
+                k_size = int(level_strength * 2) | 1
+                if k_size >= 3:
+                    pyramid.append(kornia.filters.gaussian_blur2d(inpainted_background, (k_size, k_size), (level_strength, level_strength)))
                 else:
-                    print("Refiner: Relighting enabled, but no subject found in mask. Skipping.")
-                check_for_interruption()
+                    pyramid.append(inpainted_background)
             
-            if enable_dof and dof_strength > 0:
-                background = self._apply_dof_pyramid(image_bchw, subject_mask, dof_strength, device)
-            check_for_interruption()
+            scaled_map = blur_map * (num_levels - 1)
+            final_blurred_background = pyramid[0]
+            for i in range(num_levels - 1):
+                final_blurred_background = torch.lerp(final_blurred_background, pyramid[i+1], torch.clamp(scaled_map - i, 0.0, 1.0))
 
-            final_image = torch.lerp(background, sharp_foreground, compositing_mask)
-            
-            return final_image.permute(0, 2, 3, 1)
+
+
+            transition_blur_radius = max(1.5, dof_strength * 0.7)
+            k_size_trans = int(transition_blur_radius * 2) | 1
+            transition_blur_image = kornia.filters.gaussian_blur2d(image_bchw, (k_size_trans, k_size_trans), (transition_blur_radius, transition_blur_radius))
+
+            core_mask = subject_mask.pow(3.0)
+
+
+            image_with_transition_fg = torch.lerp(final_blurred_background, transition_blur_image, subject_mask)
+
+            final_image = torch.lerp(image_with_transition_fg, image_bchw, core_mask)
+
+            return final_image
 
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error applying segmentation effects: {e}")
-            import traceback
-            traceback.print_exc()
-            return image_tensor
+            print(f"FATAL: Error in _apply_dof_pyramid (v6 w/ Explicit Layering): {e}")
+
+            return image_bchw
+
         
     def apply_correction_photo(self, image_bchw, subject_mask, strength):
-        """
-        Performs an advanced, local adaptive tone correction using CLAHE in the LAB
-        color space. This method is highly effective at revealing detail in harsh
-        highlights and deep shadows on a subject's face without affecting the overall
-        image tone.
-        """
+      
         try:
             check_for_interruption()
 
@@ -913,382 +1993,19 @@ class LatentRefiner:
             
             final_image = torch.lerp(image_bchw, corrected_image, blending_strength * subject_mask)
 
-            print(f"Refiner (Corrective): Applied local adaptive correction (CLAHE) with strength {strength:.2f}")
-
-            return torch.clamp(final_image, 0.0, 1.0)
+            final_image = self.apply_clipping_protection(final_image)
+            return final_image
 
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
             print(f"Error in automatic light correction (CLAHE): {e}")
-            import traceback
-            traceback.print_exc()
+
             return image_bchw
-       
-    def apply_correction_anime(self, image_bchw, subject_mask, strength, h, w):
-        """
-        Anime-specific lighting correction that targets harsh highlights and crushed shadows
-        within the segmented character while preserving the clean anime art style.
-        """
-        try:
-            check_for_interruption()
-
-            if strength <= 0:
-                return image_bchw
-
-            image_hsl = self.rgb_to_hsl_batch(image_bchw)
-            
-            character_lightness = self.extract_character_lightness(image_hsl, subject_mask)
-            
-            lighting_issues = self.analyze_character_lighting_issues(character_lightness)
-            
-            highlight_correction = self.create_highlight_correction_map(
-                image_hsl, subject_mask, lighting_issues, strength
-            )
-            shadow_correction = self.create_shadow_correction_map(
-                image_hsl, subject_mask, lighting_issues, strength
-            )
-            
-            corrected_hsl = self.apply_anime_lighting_corrections(
-                image_hsl, highlight_correction, shadow_correction, subject_mask
-            )
-            
-            corrected_rgb = self.hsl_to_rgb_batch(corrected_hsl)
-            
-            return torch.clamp(corrected_rgb, 0.0, 1.0)
-
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in anime lighting correction: {e}")
-            import traceback
-            traceback.print_exc()
-            return image_bchw
-    def rgb_to_hsl_batch(self, rgb_bchw):
-        """Convert RGB to HSL color space for better anime color handling"""
-        try:
-            check_for_interruption()
-            
-            r, g, b = rgb_bchw[:, 0:1], rgb_bchw[:, 1:2], rgb_bchw[:, 2:3]
-            
-            max_val = torch.max(torch.max(r, g), b)
-            min_val = torch.min(torch.min(r, g), b)
-            diff = max_val - min_val
-            
-            lightness = (max_val + min_val) / 2.0
-            
-            saturation = torch.where(
-                diff == 0,
-                torch.zeros_like(diff),
-                torch.where(
-                    lightness < 0.5,
-                    diff / (max_val + min_val + 1e-8),
-                    diff / (2.0 - max_val - min_val + 1e-8)
-                )
-            )
-            
-            hue = torch.zeros_like(diff)
-            
-            red_mask = (max_val == r) & (diff != 0)
-            hue = torch.where(red_mask, (g - b) / (diff + 1e-8), hue)
-            
-            green_mask = (max_val == g) & (diff != 0)
-            hue = torch.where(green_mask, 2.0 + (b - r) / (diff + 1e-8), hue)
-            
-            blue_mask = (max_val == b) & (diff != 0)
-            hue = torch.where(blue_mask, 4.0 + (r - g) / (diff + 1e-8), hue)
-            
-            hue = hue / 6.0
-            hue = torch.where(hue < 0, hue + 1.0, hue)
-            
-            return torch.cat([hue, saturation, lightness], dim=1)
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in RGB to HSL conversion: {e}")
-            return torch.zeros_like(rgb_bchw)
-
-    def hsl_to_rgb_batch(self, hsl_bchw):
-        """Convert HSL back to RGB color space"""
-        try:
-            check_for_interruption()
-            
-            h, s, l = hsl_bchw[:, 0:1], hsl_bchw[:, 1:2], hsl_bchw[:, 2:3]
-            
-            def hue_to_rgb(p, q, t):
-                t = torch.where(t < 0, t + 1, t)
-                t = torch.where(t > 1, t - 1, t)
-                
-                result = torch.where(t < 1/6, p + (q - p) * 6 * t, p)
-                result = torch.where((t >= 1/6) & (t < 1/2), q, result)
-                result = torch.where((t >= 1/2) & (t < 2/3), p + (q - p) * (2/3 - t) * 6, result)
-                
-                return result
-            
-            rgb = torch.cat([l, l, l], dim=1)
-            
-            q = torch.where(l < 0.5, l * (1 + s), l + s - l * s)
-            p = 2 * l - q
-            
-            r = hue_to_rgb(p, q, h + 1/3)
-            g = hue_to_rgb(p, q, h)
-            b = hue_to_rgb(p, q, h - 1/3)
-            
-            chromatic_rgb = torch.cat([r, g, b], dim=1)
-            
-            mask = (s > 1e-8).expand_as(rgb)
-            result = torch.where(mask, chromatic_rgb, rgb)
-            
-            return result
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in HSL to RGB conversion: {e}")
-            return torch.zeros_like(hsl_bchw)
-    def extract_character_lightness(self, image_hsl, subject_mask):
-        """Extract only the character's lightness values for clean analysis"""
-        try:
-            check_for_interruption()
-            
-            lightness_channel = image_hsl[:, 2:3, :, :]
-            character_lightness = lightness_channel * subject_mask
-            
-            valid_mask = subject_mask > 0.1
-            valid_lightness = character_lightness[valid_mask]
-            
-            return valid_lightness
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error extracting character lightness: {e}")
-            return torch.tensor([0.5], device=image_hsl.device)
-
-    def analyze_character_lighting_issues(self, character_lightness):
-        """Analyze the character's lighting with more practical thresholds for real anime images"""
-        try:
-            check_for_interruption()
-            
-            if character_lightness.numel() == 0:
-                return self.get_default_lighting_analysis(character_lightness.device)
-            
-            char_mean = torch.mean(character_lightness)
-            char_std = torch.std(character_lightness)
-            char_min = torch.min(character_lightness)
-            char_max = torch.max(character_lightness)
-            
-            highlight_threshold = 0.7
-            harsh_highlights = torch.sum(character_lightness > highlight_threshold).float() / character_lightness.numel()
-            
-            shadow_threshold = 0.3
-            crushed_shadows = torch.sum(character_lightness < shadow_threshold).float() / character_lightness.numel()
-            
-            is_overlit = char_mean > 0.6
-            is_underlit = char_mean < 0.4
-            has_poor_contrast = char_std < 0.2
-            
-            needs_highlight_correction = harsh_highlights > 0.02 or char_max > 0.8
-            needs_shadow_correction = crushed_shadows > 0.02 or char_min < 0.25
-            
-            return {
-                'mean_lightness': char_mean.item(),
-                'lightness_std': char_std.item(),
-                'min_lightness': char_min.item(),
-                'max_lightness': char_max.item(),
-                'harsh_highlights_ratio': max(harsh_highlights.item(), 0.1),
-                'crushed_shadows_ratio': max(crushed_shadows.item(), 0.1),
-                'is_overlit': is_overlit.item(),
-                'is_underlit': is_underlit.item(),
-                'has_poor_contrast': has_poor_contrast.item(),
-                'needs_highlight_correction': needs_highlight_correction,
-                'needs_shadow_correction': needs_shadow_correction
-            }
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error analyzing character lighting: {e}")
-            return self.get_default_lighting_analysis(character_lightness.device)
-
-    def get_default_lighting_analysis(self, device):
-        """Return default lighting analysis when character analysis fails"""
-        return {
-            'mean_lightness': 0.5,
-            'lightness_std': 0.2,
-            'min_lightness': 0.1,
-            'max_lightness': 0.9,
-            'harsh_highlights_ratio': 0.0,
-            'crushed_shadows_ratio': 0.0,
-            'is_overlit': False,
-            'is_underlit': False,
-            'has_poor_contrast': False
-        }
-    def create_highlight_correction_map(self, image_hsl, subject_mask, lighting_issues, strength):
-        """Create a more aggressive correction map for anime highlights"""
-        try:
-            check_for_interruption()
-            
-            lightness = image_hsl[:, 2:3, :, :]
-            
-            highlight_threshold = 0.6
-            moderate_highlights = (lightness > highlight_threshold).float()
-            strong_highlights = (lightness > 0.8).float()
-            
-            scale_factor = min(image_hsl.shape[-1], image_hsl.shape[-2]) / 1024.0
-            blur_radius = max(6.0 * scale_factor, 3.0)
-            kernel_size = int(blur_radius * 2) | 1
-            
-            moderate_correction = kornia.filters.gaussian_blur2d(
-                moderate_highlights,
-                (kernel_size, kernel_size),
-                (blur_radius, blur_radius)
-            )
-            
-            strong_correction = kornia.filters.gaussian_blur2d(
-                strong_highlights,
-                (kernel_size, kernel_size),
-                (blur_radius, blur_radius)
-            )
-            
-            base_moderate = 0.08 * strength
-            base_strong = 0.15 * strength
-            
-            final_correction = (moderate_correction * base_moderate + 
-                            strong_correction * base_strong) * subject_mask
-            
-            return torch.clamp(final_correction, 0.0, 0.4)
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error creating highlight correction map: {e}")
-            return torch.zeros_like(image_hsl[:, 2:3, :, :])
-
-    def create_shadow_correction_map(self, image_hsl, subject_mask, lighting_issues, strength):
-        """Create a more aggressive correction map for anime shadows"""
-        try:
-            check_for_interruption()
-            
-            lightness = image_hsl[:, 2:3, :, :]
-            
-            moderate_shadow_threshold = 0.45
-            dark_shadow_threshold = 0.25
-            
-            moderate_shadows = (lightness < moderate_shadow_threshold).float()
-            dark_shadows = (lightness < dark_shadow_threshold).float()
-            
-            scale_factor = min(image_hsl.shape[-1], image_hsl.shape[-2]) / 1024.0
-            blur_radius = max(8.0 * scale_factor, 4.0)
-            kernel_size = int(blur_radius * 2) | 1
-            
-            moderate_correction = kornia.filters.gaussian_blur2d(
-                moderate_shadows,
-                (kernel_size, kernel_size),
-                (blur_radius, blur_radius)
-            )
-            
-            dark_correction = kornia.filters.gaussian_blur2d(
-                dark_shadows,
-                (kernel_size, kernel_size),
-                (blur_radius, blur_radius)
-            )
-            
-            base_moderate = 0.06 * strength
-            base_dark = 0.12 * strength
-            
-            final_correction = (moderate_correction * base_moderate + 
-                            dark_correction * base_dark) * subject_mask
-            
-            return torch.clamp(final_correction, 0.0, 0.35)
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error creating shadow correction map: {e}")
-            return torch.zeros_like(image_hsl[:, 2:3, :, :])
-    def apply_anime_lighting_corrections(self, image_hsl, highlight_correction, shadow_correction, subject_mask):
-        """Apply lighting corrections to anime characters without position assumptions"""
-        try:
-            check_for_interruption()
-            
-            corrected_hsl = image_hsl.clone()
-            lightness = corrected_hsl[:, 2:3, :, :]
-            
-            corrected_lightness = lightness - highlight_correction
-            
-            corrected_lightness = corrected_lightness + shadow_correction
-            
-            corrected_lightness = self.apply_character_tone_balancing(
-                lightness, corrected_lightness, subject_mask
-            )
-            
-            corrected_lightness = torch.clamp(corrected_lightness, 0.0, 1.0)
-            
-            corrected_hsl[:, 2:3, :, :] = corrected_lightness
-            
-            return corrected_hsl
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error applying anime lighting corrections: {e}")
-            return image_hsl
-
-    def apply_character_tone_balancing(self, original_lightness, corrected_lightness, subject_mask):
-        """Apply gentle tone balancing and black point restoration to prevent washed out look"""
-        try:
-            check_for_interruption()
-            
-            enhanced = original_lightness + torch.sin(original_lightness * 3.14159) * 0.04
-            enhanced = torch.clamp(enhanced, 0.0, 1.0)
-            
-            character_enhanced = torch.lerp(original_lightness, enhanced, subject_mask * 0.3)
-            
-            balanced_lightness = torch.lerp(corrected_lightness, character_enhanced, 0.5)
-            
-            restored_lightness = self.apply_black_point_restoration(
-                original_lightness, balanced_lightness, subject_mask
-            )
-            
-            return restored_lightness
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in character tone balancing: {e}")
-            return corrected_lightness
-
-    def apply_black_point_restoration(self, original_lightness, corrected_lightness, subject_mask):
-        """Restore black point and contrast to prevent washed out appearance"""
-        try:
-            check_for_interruption()
-            
-            correction_amount = torch.abs(corrected_lightness - original_lightness) * subject_mask
-            max_correction = torch.max(correction_amount)
-            
-            if max_correction > 0.02:
-                gamma_strength = torch.clamp(max_correction * 2.0, 0.05, 0.2)
-                gamma_value = 1.0 + gamma_strength
-                
-                gamma_corrected = torch.pow(corrected_lightness + 1e-8, gamma_value)
-                
-                correction_mask = torch.clamp(correction_amount * 10.0, 0.0, 1.0)
-                final_lightness = torch.lerp(corrected_lightness, gamma_corrected, correction_mask * 0.6)
-                
-                return final_lightness
-            else:
-                return corrected_lightness
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in black point restoration: {e}")
-            return corrected_lightness
-        
-        
+              
+   
     def apply_professional_relighting(self, image_bchw, subject_mask, strength, device):
+
         try:
             check_for_interruption()
             
@@ -1301,16 +2018,16 @@ class LatentRefiner:
             
             key_light = self.create_key_light(h, w, device, scale_factor)
             fill_light = self.create_fill_light(h, w, device, scale_factor)
-            rim_light = self.create_rim_light(h, w, device, scale_factor, mask_system['core_mask'])
             
             lighting_analysis = self.analyze_subject_lighting(image_bchw, subject_mask)
             
             relit_image = self.apply_adaptive_studio_lighting_smooth(
                 image_bchw, mask_system, detail_preservation, 
-                key_light, fill_light, rim_light, 
+                key_light, fill_light,  
                 lighting_analysis, strength
             )
             
+            relit_image = self.apply_clipping_protection(relit_image)
             return relit_image
             
         except model_management.InterruptProcessingException:
@@ -1318,8 +2035,9 @@ class LatentRefiner:
         except Exception as e:
             print(f"Error in professional relighting: {e}")
             return image_bchw
+
     def apply_adaptive_studio_lighting_smooth(self, image_bchw, mask_system, detail_preservation,
-                                            key_light, fill_light, rim_light, lighting_analysis, strength):
+                                            key_light, fill_light, lighting_analysis, strength):
         try:
             check_for_interruption()
 
@@ -1331,7 +2049,6 @@ class LatentRefiner:
             exposure_strength = 0.5
             key_strength = 0.35 * (0.8 if lighting_analysis['avg_brightness'] > 0.7 else 1.2)
             fill_strength = 0.2 + (lighting_analysis['shadow_severity'] * 0.25)
-            rim_strength = 0.3
             color_strength = 0.6
             contrast_strength = 0.45
 
@@ -1345,9 +2062,7 @@ class LatentRefiner:
             fully_relit_image = self.apply_light_to_subject_smooth(
                 fully_relit_image, mask_system, detail_preservation, fill_light, fill_strength, 'fill'
             )
-            fully_relit_image = self.apply_light_to_subject_smooth(
-                fully_relit_image, mask_system, detail_preservation, rim_light, rim_strength, 'rim'
-            )
+       
 
             if abs(lighting_analysis['color_temperature']) > 0.1:
                 fully_relit_image = self.apply_color_temperature_correction_smooth(
@@ -1358,14 +2073,11 @@ class LatentRefiner:
             )
 
             blending_strength = pow(strength, 1.5)
-
             relit_image = torch.lerp(image_bchw, fully_relit_image, blending_strength * mask_system['combined_mask'])
             
             if blending_strength > 0:
                 gamma = 1.0 + (0.15 * blending_strength)
-                
                 darkened_image = torch.clamp(relit_image.pow(gamma), 0.0, 1.0)
-
                 final_image = torch.lerp(relit_image, darkened_image, mask_system['combined_mask'])
             else:
                 final_image = relit_image
@@ -1377,6 +2089,7 @@ class LatentRefiner:
         except Exception as e:
             print(f"Error in smooth adaptive studio lighting: {e}")
             return image_bchw
+
     def create_smooth_subject_mask(self, subject_mask, scale_factor):
         try:
             check_for_interruption()
@@ -1422,6 +2135,7 @@ class LatentRefiner:
                 'transition_mask': subject_mask,
                 'combined_mask': subject_mask
             }
+
     def create_detail_preservation_mask(self, image_bchw, subject_mask, scale_factor):
         try:
             check_for_interruption()
@@ -1463,7 +2177,7 @@ class LatentRefiner:
         except Exception as e:
             print(f"Error creating detail preservation mask: {e}")
             return torch.zeros_like(subject_mask)
-    
+
     def create_key_light(self, h, w, device, scale_factor):
         light_x = 0.5
         light_y = 0.3
@@ -1516,42 +2230,6 @@ class LatentRefiner:
         
         return fill_light.unsqueeze(0).unsqueeze(0) * 0.06
 
-    def create_rim_light(self, h, w, device, scale_factor, subject_mask):
-        
-        blur_radius = max(2.0 * scale_factor, 1.0)
-        kernel_size = int(blur_radius * 2) | 1
-        
-        soft_mask = kornia.filters.gaussian_blur2d(
-            subject_mask,
-            (kernel_size, kernel_size),
-            (blur_radius, blur_radius)
-        )
-        
-        edge_kernel = torch.tensor([[-0.5, -0.5, -0.5], [-0.5, 4, -0.5], [-0.5, -0.5, -0.5]], 
-                                dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-        
-        edges = F.conv2d(soft_mask, edge_kernel, padding=1)
-        edges = torch.clamp(torch.abs(edges), 0, 1)
-        
-        y_coords, x_coords = torch.meshgrid(
-            torch.linspace(0, 1, h, device=device),
-            torch.linspace(0, 1, w, device=device),
-            indexing='ij'
-        )
-        
-        rim_direction = torch.clamp(x_coords * 0.3 + (1.0 - y_coords) * 0.2 + 0.5, 0, 1)
-        
-        rim_light = edges * rim_direction
-        
-        blur_radius = max(8.0 * scale_factor, 3.0)
-        kernel_size = int(blur_radius * 2) | 1
-        rim_light = kornia.filters.gaussian_blur2d(
-            rim_light,
-            (kernel_size, kernel_size),
-            (blur_radius, blur_radius)
-        )
-        
-        return rim_light * 0.05
     def analyze_subject_lighting(self, image_bchw, subject_mask):
         try:
             check_for_interruption()
@@ -1606,7 +2284,6 @@ class LatentRefiner:
                 'color_temperature': 0.0
             }
 
-    
     def apply_smart_exposure_correction_smooth(self, image_bchw, mask_system, detail_preservation, strength):
         try:
             check_for_interruption()
@@ -1648,6 +2325,7 @@ class LatentRefiner:
         except Exception as e:
             print(f"Error in smooth smart exposure correction: {e}")
             return image_bchw
+
     def apply_subject_contrast_enhancement_smooth(self, image_bchw, mask_system, detail_preservation, strength):
         try:
             check_for_interruption()
@@ -1667,15 +2345,11 @@ class LatentRefiner:
             luminance_ratio = enhanced_luminance / (luminance + 1e-8)
             luminance_ratio = torch.clamp(luminance_ratio, 0.7, 1.5)
             
-            core_ratio = luminance_ratio * mask_system['core_mask']
-            falloff_ratio = torch.lerp(torch.ones_like(luminance_ratio), luminance_ratio, 0.6) * mask_system['falloff_mask']
-            transition_ratio = torch.lerp(torch.ones_like(luminance_ratio), luminance_ratio, 0.3) * mask_system['transition_mask']
+            core_ratio = torch.lerp(torch.ones_like(luminance_ratio), luminance_ratio, mask_system['core_mask'])
+            falloff_ratio = torch.lerp(torch.ones_like(luminance_ratio), luminance_ratio, mask_system['falloff_mask'] * 0.6)
+            transition_ratio = torch.lerp(torch.ones_like(luminance_ratio), luminance_ratio, mask_system['transition_mask'] * 0.3)
             
-            background_ratio = torch.ones_like(luminance_ratio) * (1.0 - torch.clamp(
-                mask_system['core_mask'] + mask_system['falloff_mask'] + mask_system['transition_mask'], 0, 1
-            ))
-            
-            final_ratio = core_ratio + falloff_ratio + transition_ratio + background_ratio
+            final_ratio = core_ratio * falloff_ratio * transition_ratio
             
             for c in range(3):
                 channel = result[:, c:c+1, :, :]
@@ -1689,6 +2363,7 @@ class LatentRefiner:
         except Exception as e:
             print(f"Error in smooth subject contrast enhancement: {e}")
             return image_bchw
+
     def apply_light_to_subject_smooth(self, image_bchw, mask_system, detail_preservation, light_map, strength, light_type):
         try:
             check_for_interruption()
@@ -1761,6 +2436,7 @@ class LatentRefiner:
         except Exception as e:
             print(f"Error applying {light_type} light with smooth blending: {e}")
             return image_bchw
+
     def apply_color_temperature_correction_smooth(self, image_bchw, mask_system, temperature_bias, strength):
         try:
             check_for_interruption()
@@ -1996,7 +2672,6 @@ class LatentRefiner:
         return skin_mask_blurred
     
     def apply_clarity_gpu(self, image_tensor, strength):
-
         try:
             check_for_interruption()
             
@@ -2017,15 +2692,21 @@ class LatentRefiner:
             
             midtone_mask = self.create_midtone_mask(l_normalized)
             
-            adaptive_strength = strength * midtone_mask
+            focus_mask = torch.ones_like(l_normalized)
+            if self.cached_depth_map is not None:
+                depth_map_device = self.cached_depth_map.to(l_normalized.device)
+                if depth_map_device.shape[-2:] == l_normalized.shape[-2:]:
+                    focus_mask = depth_map_device.pow(0.75)
+                else:
+                    print(f"Warning: Depth map dimensions ({self.cached_depth_map.shape[-2:]}) do not match image ({l_normalized.shape[-2:]}). Skipping depth awareness for clarity.")
+            
+            adaptive_strength = strength * midtone_mask * focus_mask
             
             enhanced_l_normalized = l_normalized + clarity_detail * adaptive_strength
             enhanced_l_normalized = torch.clamp(enhanced_l_normalized, 0.0, 1.0)
             
             enhanced_l = enhanced_l_normalized * 100.0
-            
             enhanced_lab = torch.cat([enhanced_l, image_lab[:, 1:3, :, :]], dim=1)
-            
             final_rgb_bchw = kornia.color.lab_to_rgb(enhanced_lab)
             
             return torch.clamp(final_rgb_bchw, 0.0, 1.0).permute(0, 2, 3, 1)
@@ -2138,7 +2819,6 @@ class LatentRefiner:
             return tensor
     
     def apply_smart_sharpen(self, image_tensor, strength):
- 
         try:
             check_for_interruption()
             
@@ -2160,36 +2840,40 @@ class LatentRefiner:
             
             blur_small = self.advanced_gaussian_blur(gray, 0.5, device, dtype)
             blur_medium = self.advanced_gaussian_blur(gray, 1.5, device, dtype)
-            blur_large = self.advanced_gaussian_blur(gray, 3.0, device, dtype)
-            
             detail_fine = gray - blur_small
-            detail_medium = gray - blur_medium  
-            detail_coarse = gray - blur_large
+            detail_medium = gray - blur_medium
             
             detail_magnitude = torch.abs(detail_medium)
             edge_mask = torch.tanh(detail_magnitude * 20.0)
-            
             edge_mask = edge_mask * edge_fade
-            
             smooth_mask = torch.tanh(detail_magnitude * 5.0)
             edge_mask = edge_mask * (0.3 + 0.7 * smooth_mask)
             
-            if strength <= 0.5:
-                combined_detail = detail_fine * 0.7 + detail_medium * 0.3
-                multiplier = strength * 4.0
-            elif strength <= 1.0:
-                combined_detail = detail_fine * 0.4 + detail_medium * 0.4 + detail_coarse * 0.2
-                multiplier = 2.0 + (strength - 0.5) * 6.0
+            focus_mask = torch.ones_like(edge_mask)
+            if self.cached_depth_map is not None:
+                depth_map_device = self.cached_depth_map.to(edge_mask.device)
+                h_current, w_current = edge_mask.shape[-2:]
+                
+                if depth_map_device.shape[-2:] != (h_current, w_current):
+                    depth_map_resized_local = F.interpolate(depth_map_device, size=(h_current, w_current), mode='bilinear', align_corners=False)
+                else:
+                    depth_map_resized_local = depth_map_device
+
+                focus_mask = depth_map_resized_local.pow(1.5)
+            
+            edge_mask = edge_mask * focus_mask
+
+            if strength <= 1.0:
+                sharpening_amount = strength * 2.0
             else:
-                combined_detail = detail_fine * 0.2 + detail_medium * 0.5 + detail_coarse * 0.3
-                multiplier = 5.0 + (strength - 1.0) * 10.0
+                sharpening_amount = 2.0 + (strength - 1.0) * 8.0
             
             for c in range(3):
                 channel = image_bchw[:, c:c+1]
                 channel_blur = self.advanced_gaussian_blur(channel, 1.0, device, dtype)
                 channel_detail = channel - channel_blur
                 
-                sharpening = channel_detail * edge_mask * multiplier
+                sharpening = channel_detail * edge_mask * sharpening_amount
                 image_bchw[:, c:c+1] = channel + sharpening
             
             return torch.clamp(image_bchw, 0.0, 1.0).permute(0, 2, 3, 1)
@@ -2222,263 +2906,3 @@ class LatentRefiner:
         mask_4d = mask_2d.unsqueeze(0).unsqueeze(0)
         
         return mask_4d
-   
-    def apply_latent_refinement(self, latent_samples, strength):
-        try:
-            check_for_interruption()
-            
-            if strength == 0.0:
-                return latent_samples
-            
-
-            sharpen_strength = pow(strength, 0.75)
-            
-            balance_strength = pow(strength, 2.0) * 0.5
-
-            noise_enhancement_strength = pow(strength, 1.5) * 0.6
-
-            
-            refined_samples = latent_samples
-            
-            refined_samples = self.balance_latent_channels(refined_samples, balance_strength)
-            check_for_interruption()
-            
-            refined_samples = self.enhance_latent_noise_structure(refined_samples, noise_enhancement_strength)
-            check_for_interruption()
-            
-            refined_samples = self.sharpen_latent_detail(refined_samples, sharpen_strength)
-            check_for_interruption()
-            
-            return refined_samples
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in apply_latent_refinement: {e}")
-            return latent_samples
-    def balance_latent_channels(self, latent_samples, strength=0.3):
-        try:
-            check_for_interruption()
-            
-            if strength == 0.0:
-                return latent_samples
-                
-            device = latent_samples.device
-            dtype = latent_samples.dtype
-            
-            balanced_samples = latent_samples.clone()
-            
-            for i in range(4):
-                channel = balanced_samples[:, i:i+1, :, :]
-                
-                current_mean = torch.mean(channel)
-                current_std = torch.std(channel)
-                
-                mean_threshold = 2.0
-                if torch.abs(current_mean) > mean_threshold:
-                    adjustment = (torch.abs(current_mean) - mean_threshold) * torch.sign(current_mean)
-                    mean_adjustment = -adjustment * strength * 0.1
-                    channel = channel + mean_adjustment
-                
-                if current_std < 0.1:
-                    noise_boost = torch.randn_like(channel) * strength * 0.02
-                    channel = channel + noise_boost
-                elif current_std > 2.5:
-                    smoothing_factor = 1.0 - (strength * 0.15)
-                    channel = (channel - current_mean) * smoothing_factor + current_mean
-                
-                balanced_samples[:, i:i+1, :, :] = channel
-            
-            return balanced_samples
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in balance_latent_channels: {e}")
-            return latent_samples
-    def analyze_latent_noise_quality(self, latent_samples):
-        try:
-            check_for_interruption()
-            
-            device = latent_samples.device
-            dtype = latent_samples.dtype
-            
-            channel_stats = {}
-            for i in range(4):
-                channel = latent_samples[:, i:i+1, :, :]
-                
-                mean = torch.mean(channel)
-                std = torch.std(channel)
-                
-                grad_x = torch.abs(channel[:, :, :, 1:] - channel[:, :, :, :-1])
-                grad_y = torch.abs(channel[:, :, 1:, :] - channel[:, :, :-1, :])
-                
-                high_freq_content = (torch.mean(grad_x) + torch.mean(grad_y)) / 2.0
-                
-                local_variance = F.avg_pool2d(channel.pow(2), 8, stride=4) - F.avg_pool2d(channel, 8, stride=4).pow(2)
-                dead_zone_ratio = torch.mean((local_variance < 0.001).float())
-                
-                channel_stats[i] = {
-                    'mean': mean,
-                    'std': std,
-                    'high_freq': high_freq_content,
-                    'dead_zones': dead_zone_ratio
-                }
-            
-            return channel_stats
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in analyze_latent_noise_quality: {e}")
-            return {}
-    def enhance_latent_noise_structure(self, latent_samples, strength=0.3):
-        try:
-            check_for_interruption()
-            
-            if strength == 0.0:
-                return latent_samples
-                
-            device = latent_samples.device
-            dtype = latent_samples.dtype
-            
-            noise_stats = self.analyze_latent_noise_quality(latent_samples)
-            enhanced_samples = latent_samples.clone()
-            
-            for channel_idx in range(4):
-                channel = enhanced_samples[:, channel_idx:channel_idx+1, :, :]
-                stats = noise_stats.get(channel_idx, {})
-                
-                if stats.get('dead_zones', 0) > 0.3:
-                    dead_zone_mask = self.create_dead_zone_mask(channel)
-                    structured_noise = self.generate_structured_noise(channel.shape, device, dtype)
-                    
-                    noise_amount = strength * 0.005 * dead_zone_mask
-                    channel = channel + structured_noise * noise_amount
-                
-                if stats.get('high_freq', 0) < 0.05:
-                    detail_enhancement = self.enhance_latent_detail(channel, strength * 0.2)
-                    channel = channel + detail_enhancement
-                
-                enhanced_samples[:, channel_idx:channel_idx+1, :, :] = channel
-            
-            return enhanced_samples
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in enhance_latent_noise_structure: {e}")
-            return latent_samples
-    def sharpen_latent_detail(self, latent_samples, strength=0.3):
-        try:
-            check_for_interruption()
-            
-            if strength == 0.0:
-                return latent_samples
-                
-            device = latent_samples.device
-            dtype = latent_samples.dtype
-            
-            sharpened_samples = latent_samples.clone()
-            
-            for i in range(4):
-                channel = sharpened_samples[:, i:i+1, :, :]
-                original_mean = torch.mean(channel)
-                
-                blur_small = kornia.filters.gaussian_blur2d(channel, (3, 3), (0.8, 0.8))
-                blur_medium = kornia.filters.gaussian_blur2d(channel, (5, 5), (1.5, 1.5))
-                
-                detail_fine = channel - blur_small
-                detail_medium = channel - blur_medium
-                combined_detail = (detail_fine * 0.6 + detail_medium * 0.4)
-                
-                max_detail_value = 1.5
-                combined_detail = torch.clamp(combined_detail, -max_detail_value, max_detail_value)
-                
-                detail_magnitude = torch.abs(combined_detail)
-                adaptive_mask = torch.tanh(detail_magnitude * 10.0)
-                
-                sharpening_amount = strength * 0.5 * adaptive_mask
-                enhanced_channel = channel + combined_detail * sharpening_amount
-                
-                current_mean = torch.mean(enhanced_channel)
-                mean_correction = original_mean - current_mean
-                enhanced_channel = enhanced_channel + mean_correction
-                
-                sharpened_samples[:, i:i+1, :, :] = enhanced_channel
-            
-            return sharpened_samples
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in sharpen_latent_detail: {e}")
-            return latent_samples
-    def create_dead_zone_mask(self, channel):
-        try:
-            check_for_interruption()
-            
-            local_variance = F.avg_pool2d(channel.pow(2), 8, stride=1, padding=4) - F.avg_pool2d(channel, 8, stride=1, padding=4).pow(2)
-            
-            dead_zone_mask = (local_variance < 0.001).float()
-            
-            kernel_size = 5
-            smooth_kernel = torch.ones((1, 1, kernel_size, kernel_size), dtype=channel.dtype, device=channel.device) / (kernel_size * kernel_size)
-            dead_zone_mask = F.conv2d(dead_zone_mask, smooth_kernel, padding=kernel_size//2)
-            
-            return dead_zone_mask
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in create_dead_zone_mask: {e}")
-            return torch.zeros_like(channel)
-
-    def generate_structured_noise(self, shape, device, dtype):
-        try:
-            check_for_interruption()
-            
-            noise_base = torch.randn(shape, device=device, dtype=dtype)
-            
-            h, w = shape[-2], shape[-1]
-            
-            if h > 16 and w > 16:
-                noise_low = F.interpolate(
-                    torch.randn((shape[0], shape[1], h//4, w//4), device=device, dtype=dtype),
-                    size=(h, w), mode='bilinear', align_corners=False
-                )
-                noise_base = noise_base * 0.7 + noise_low * 0.3
-            
-            if h > 8 and w > 8:
-                noise_base = kornia.filters.gaussian_blur2d(noise_base, (3, 3), (0.5, 0.5))
-            
-            return noise_base
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in generate_structured_noise: {e}")
-            return torch.randn(shape, device=device, dtype=dtype)
-
-    def enhance_latent_detail(self, channel, strength):
-        try:
-            check_for_interruption()
-            
-            grad_x = channel[:, :, :, 1:] - channel[:, :, :, :-1]
-            grad_y = channel[:, :, 1:, :] - channel[:, :, :-1, :]
-            
-            grad_x = F.pad(grad_x, (0, 1, 0, 0), mode='replicate')
-            grad_y = F.pad(grad_y, (0, 0, 0, 1), mode='replicate')
-            
-            enhanced_grad_x = torch.tanh(grad_x * 3.0) * strength * 0.1
-            enhanced_grad_y = torch.tanh(grad_y * 3.0) * strength * 0.1
-            
-            detail_enhancement = (enhanced_grad_x + enhanced_grad_y) * 0.5
-            
-            return detail_enhancement
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error in enhance_latent_detail: {e}")
-            return torch.zeros_like(channel)

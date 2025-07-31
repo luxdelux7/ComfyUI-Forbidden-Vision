@@ -1,0 +1,46 @@
+# Forbidden Vision Model Preferences Configuration
+# 
+# Instructions:
+# 1. Rename this file to "model_choice.yaml" to activate custom preferences
+# 2. Models are tried in order - first found model becomes the default
+# 3. Remove or comment out models you don't want as preferred
+# 4. Add your own model names to the lists
+#
+# Note: This file won't be overwritten by plugin updates once renamed
+
+# Symbol to mark preferred models in dropdowns
+preferred_model_symbol: "🌟"
+# Available symbols: 🌟 ⭐ ✨ 💎 🔥 ⚡ 🎯
+
+# Preferred models for each category
+preferred_models:
+  
+  # Upscaler models (tried in order for default selection)
+  upscaler:
+    - "4x_NMKD-Siax_200k.pth"
+    - "4x-UltraSharp.pth"
+    - "4x_foolhardy_Remacri.pth"
+    - "4x-AnimeSharp.pth"
+  
+  # BBOX detection models (tried in order for default selection)
+  bbox:
+    - "face_yolov8n_v2.pt"
+    - "face_yolov8m.pt"
+    - "yolov8x6_animeface.pt"
+  
+  # Segmentation models (tried in order for default selection)
+  segmentation:
+    - "preferred_sam_model.pth"
+    - "preferred_yoloseg_model.pt"
+    - "backup_seg_model.pt"
+
+# Example of how to customize:
+# 
+# preferred_models:
+#   upscaler:
+#     - "my_favorite_4x_model.pth"
+#     - "4x-UltraSharp.pth"
+#   bbox:
+#     - "custom_face_detector.pt"
+#   segmentation:
+#     - "sam_vit_h_4b8939.pth"

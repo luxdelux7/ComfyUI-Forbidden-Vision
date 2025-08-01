@@ -12,7 +12,7 @@ import cv2
 import urllib.request
 from PIL import Image
 from . import mood_presets
-from .utils import check_for_interruption, get_ordered_upscaler_model_list
+from .utils import check_for_interruption, get_refiner_upscaler_models, clean_model_name
 
 try:
     from transparent_background import Remover
@@ -53,27 +53,24 @@ if Remover is None:
 class LatentRefiner:
     @classmethod
     def INPUT_TYPES(s):
-        upscaler_models = get_ordered_upscaler_model_list()
-        
-        simple_method = "Simple: Bicubic (Standard)"
-        upscaler_models.insert(0, simple_method)
+        upscaler_models = get_refiner_upscaler_models()
+        default_upscaler = upscaler_models[1] if len(upscaler_models) > 1 else upscaler_models[0]        
 
         return {
             "required": {
 
                 "enable_upscale": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
-                "upscale_model": (upscaler_models, ),
+                "upscale_model": (upscaler_models, {"default": default_upscaler}),
                 "upscale_factor": ("FLOAT", {"default": 1.2, "min": 1.0, "max": 8.0, "step": 0.05}),
                 
-                "enable_auto_tone": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "label": "Enable Auto Tone Correction"}),
-
-                "enable_dof_effect": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
-                "dof_blur_strength": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.5}),
+                "enable_auto_tone": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),
+                "ai_enable_dof": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
+                "ai_dof_strength": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.5}),
                 
-                "relighting_mode": (["Disabled", "Additive (Simple)", "Corrective"],),
-                "relight_strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "mood_preset": (list(mood_presets.PRESETS.keys()), ), 
-                "mood_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "ai_relighting": (["Disabled", "Additive (Simple)", "Corrective"],),
+                "ai_relight_strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "ai_mood_preset": (list(mood_presets.PRESETS.keys()), ), 
+                "ai_mood_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
 
                 
                 "enable_vibrance": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
@@ -265,18 +262,20 @@ class LatentRefiner:
             return None, None
         
     def load_upscaler_model(self, model_name):
-        if self.upscaler_model is not None and self.upscaler_model_name == model_name:
+        clean_model_name_val = clean_model_name(model_name)
+        
+        if self.upscaler_model is not None and self.upscaler_model_name == clean_model_name_val:
             return self.upscaler_model
         try:
             UpscalerLoaderClass = nodes.NODE_CLASS_MAPPINGS['UpscaleModelLoader']
             upscaler_loader = UpscalerLoaderClass()
-            self.upscaler_model = upscaler_loader.load_model(model_name)[0]
-            self.upscaler_model_name = model_name
+            self.upscaler_model = upscaler_loader.load_model(clean_model_name_val)[0]
+            self.upscaler_model_name = clean_model_name_val
             return self.upscaler_model
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
-            print(f"Error loading upscaler model {model_name}: {e}")
+            print(f"Error loading upscaler model {clean_model_name_val}: {e}")
             self.upscaler_model = None; self.upscaler_model_name = None
             return None
     
@@ -399,9 +398,9 @@ class LatentRefiner:
     def refine_and_process(self,
                         enable_auto_tone,
                         enable_upscale, upscale_model, upscale_factor,
-                        enable_dof_effect, dof_blur_strength,
-                        relighting_mode, relight_strength,
-                        mood_preset, mood_strength,
+                        ai_enable_dof, ai_dof_strength,
+                        ai_relighting, ai_relight_strength,
+                        ai_mood_preset, ai_mood_strength,
                         enable_vibrance, vibrance_strength,
                         enable_clarity, clarity_strength,
                         enable_smart_sharpen, sharpening_strength,
@@ -438,9 +437,9 @@ class LatentRefiner:
 
             image_bchw = image_to_process.permute(0, 3, 1, 2)
             
-            is_mood_preset_active = (mood_preset != "Disabled" or mood_image is not None) and mood_strength > 0
-            is_relighting_active = relighting_mode != "Disabled" and relight_strength > 0
-            is_dof_active = enable_dof_effect and dof_blur_strength > 0
+            is_mood_preset_active = (ai_mood_preset != "Disabled" or mood_image is not None) and ai_mood_strength > 0
+            is_relighting_active = ai_relighting != "Disabled" and ai_relight_strength > 0
+            is_dof_active = ai_enable_dof and ai_dof_strength > 0
             is_segmentation_needed = is_mood_preset_active or is_relighting_active or is_dof_active
             is_depth_needed = is_dof_active
 
@@ -462,25 +461,25 @@ class LatentRefiner:
                     target_h, target_w = image_bchw.shape[-2:]
                     preset_data = self.analyze_image_to_preset(mood_image, target_h, target_w)
                 else:
-                    preset_data = mood_presets.PRESETS.get(mood_preset, {})
+                    preset_data = mood_presets.PRESETS.get(ai_mood_preset, {})
                 
                 if preset_data:
                     image_bchw = self.apply_mood_and_lighting_transfer(
-                        image_bchw, self.cached_subject_mask, self.cached_depth_map, preset_data, mood_strength
+                        image_bchw, self.cached_subject_mask, self.cached_depth_map, preset_data, ai_mood_strength
                     )
 
             final_foreground = image_bchw.clone()
             final_background = image_bchw.clone()
 
             if is_dof_active and self.cached_depth_map is not None and self.cached_subject_mask is not None:
-                final_background = self._apply_dof_pyramid(final_background, self.cached_subject_mask, self.cached_depth_map, dof_blur_strength, device)
+                final_background = self._apply_dof_pyramid(final_background, self.cached_subject_mask, self.cached_depth_map, ai_dof_strength, device)
 
             if is_relighting_active and self.cached_subject_mask is not None:
                 if self.cached_subject_mask.sum() > 0:
-                    adjusted_relight_strength = relight_strength * 0.5 if is_mood_preset_active else relight_strength
-                    if relighting_mode == "Additive (Simple)":
+                    adjusted_relight_strength = ai_relight_strength * 0.5 if is_mood_preset_active else ai_relight_strength
+                    if ai_relighting == "Additive (Simple)":
                         final_foreground = self.apply_professional_relighting(final_foreground, self.cached_subject_mask, (adjusted_relight_strength ** 0.7 * 1.8), device)
-                    elif relighting_mode == "Corrective":
+                    elif ai_relighting == "Corrective":
                         final_foreground = self.apply_correction_photo(final_foreground, self.cached_subject_mask, adjusted_relight_strength)
 
             if self.cached_subject_mask is not None and (is_dof_active or is_relighting_active):

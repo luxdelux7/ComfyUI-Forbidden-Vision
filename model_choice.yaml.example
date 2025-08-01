@@ -8,39 +8,63 @@
 #
 # Note: This file won't be overwritten by plugin updates once renamed
 
-# Symbol to mark preferred models in dropdowns
-preferred_model_symbol: "🌟"
-# Available symbols: 🌟 ⭐ ✨ 💎 🔥 ⚡ 🎯
-
 # Preferred models for each category
 preferred_models:
   
-  # Upscaler models (tried in order for default selection)
+  # Face processor upscaler models (for pre-upscaling small faces)
   upscaler:
     - "4x_NMKD-Siax_200k.pth"
     - "4x-UltraSharp.pth"
     - "4x_foolhardy_Remacri.pth"
     - "4x-AnimeSharp.pth"
   
-  # BBOX detection models (tried in order for default selection)
-  bbox:
+  # Refiner node upscaler models (for final image enhancement)
+  refiner_upscaler:
+    - "4x-UltraSharp.pth"
+    - "4x_NMKD-Siax_200k.pth"
+    - "RealESRGAN_x4plus.pth"
+    - "ESRGAN_4x.pth"
+  
+  # Primary BBOX detection models (main face detector)
+  bbox_primary:
     - "face_yolov8n_v2.pt"
     - "face_yolov8m.pt"
     - "yolov8x6_animeface.pt"
+    - "yolov8n-face.pt"
   
-  # Segmentation models (tried in order for default selection)
-  segmentation:
-    - "preferred_sam_model.pth"
-    - "preferred_yoloseg_model.pt"
-    - "backup_seg_model.pt"
+  # Secondary BBOX detection models (backup face detector)
+  bbox_secondary:
+    - "face_yolov8m.pt"
+    - "yolov8x6_animeface.pt"
+    - "face_yolov8n_v2.pt"
+    - "yolov8s-face.pt"
+  
+  # Primary segmentation models (SAM + YOLO-seg for main masking)
+  segmentation_primary:
+    - "sam_vit_h_4b8939.pth"
+    - "sam_vit_l_0b3195.pth"
+    - "yolov8n-seg.pt"
+    - "yolov8s-seg.pt"
+  
+  # Secondary segmentation models (YOLO-seg only for ensemble masking)
+  segmentation_secondary:
+    - "yolov8n-seg.pt"
+    - "yolov8s-seg.pt"
+    - "yolov8m-seg.pt"
+    - "yolov8l-seg.pt"
 
-# Example of how to customize:
+# Example of how to customize for your specific models:
 # 
 # preferred_models:
 #   upscaler:
-#     - "my_favorite_4x_model.pth"
-#     - "4x-UltraSharp.pth"
-#   bbox:
-#     - "custom_face_detector.pt"
-#   segmentation:
+#     - "my_favorite_face_upscaler.pth"
+#   refiner_upscaler:
+#     - "my_favorite_final_upscaler.pth"
+#   bbox_primary:
+#     - "custom_face_detector_v3.pt"
+#   bbox_secondary:
+#     - "backup_face_detector.pt"
+#   segmentation_primary:
 #     - "sam_vit_h_4b8939.pth"
+#   segmentation_secondary:
+#     - "custom_yolo_seg.pt"

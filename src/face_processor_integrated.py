@@ -53,15 +53,22 @@ class ForbiddenVisionFaceProcessorIntegrated:
         upscaler_models = get_ordered_upscaler_model_list()
         
         def get_preferred_default(model_list, preferred_list, fallback=None):
-            clean_model_list = [clean_model_name(model) for model in model_list]
+            # First, iterate through the user's preferred models from the config
+            for preferred_name in preferred_list:
+                # Then, iterate through the actual list of models available in the dropdown
+                for model_in_list in model_list:
+                    # Clean the model name from the list (to remove the symbol)
+                    cleaned_model_in_list = clean_model_name(model_in_list)
+                    # If the cleaned name matches the user's preference, we found our default
+                    if cleaned_model_in_list == preferred_name:
+                        # Return the model name *with* its symbol intact
+                        return model_in_list
             
-            for preferred in preferred_list:
-                if preferred in clean_model_list:
-                    original_index = clean_model_list.index(preferred)
-                    return model_list[original_index]
-            
+            # If no preferred models were found in the list, use the fallback
             if fallback and fallback in model_list:
                 return fallback
+            
+            # If still no match, return the first item in the list
             return model_list[0] if model_list else "None Found"
         
         default_upscaler = get_preferred_default(
@@ -69,27 +76,27 @@ class ForbiddenVisionFaceProcessorIntegrated:
             config['preferred_models']['upscaler'], 
             "Fast 4x (Lanczos)"
         )
-        
+
         default_bbox = get_preferred_default(
             yolo_models, 
-            config['preferred_models']['bbox']
+            config['preferred_models']['bbox_primary']
         )
-        
+
         default_bbox_b = get_preferred_default(
             ["None"] + yolo_models, 
-            config['preferred_models']['bbox'], 
+            config['preferred_models']['bbox_secondary'], 
             "None"
         )
-        
+
         default_seg = get_preferred_default(
             sam_models, 
-            config['preferred_models']['segmentation'], 
+            config['preferred_models']['segmentation_primary'], 
             "None"
         )
-        
+
         default_seg_b = get_preferred_default(
             yolo_seg_models_only, 
-            config['preferred_models']['segmentation'], 
+            config['preferred_models']['segmentation_secondary'], 
             "None"
         )
         
@@ -422,6 +429,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 return self.create_safe_fallback_outputs(input_image, processing_resolution)
 
             original_image = input_image
+            processing_image = torch.flip(input_image, dims=[1]) if enable_vertical_flip else input_image.clone()
             final_positive_for_face, final_negative_for_face = positive, negative
 
             if clip and (exclusions or face_positive_prompt or face_negative_prompt):
@@ -469,13 +477,12 @@ class ForbiddenVisionFaceProcessorIntegrated:
             elif not clip and (exclusions or face_positive_prompt or face_negative_prompt):
                 print("[Face Processor] Warning: Face prompts or exclusions were provided, but no CLIP model was connected. These options will be ignored.")
 
-
             face_masks = []
             if mask is not None:
-                face_masks = [mask]
+                face_masks = [torch.flip(mask, dims=[1]) if enable_vertical_flip else mask]
             else:
                 np_masks = self.face_detector.detect_faces(
-                    image_tensor=input_image, 
+                    image_tensor=processing_image, 
                     bbox_model_name=bbox_model,
                     bbox_model_B_name=bbox_model_B,
                     sam_model_name=yolo_seg_model,
@@ -492,10 +499,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 return self.create_safe_fallback_outputs(input_image, processing_resolution)
             
             self.last_sampling_key = None 
-            
-            processing_image = torch.flip(input_image, dims=[1]) if enable_vertical_flip else input_image.clone()
-            if enable_vertical_flip and mask is not None:
-                face_masks = [torch.flip(m, dims=[1]) for m in face_masks]
             
             all_processed_faces, all_restore_info = [], []
             
@@ -518,15 +521,14 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 print("ERROR: All face processing failed. Returning original image.")
                 return self.create_safe_fallback_outputs(original_image, processing_resolution)
 
-            compositing_base_image = torch.flip(input_image, dims=[1]) if enable_vertical_flip else original_image.clone()
             final_image = self.combine_all_faces_to_final_image(
-                compositing_base_image, all_processed_faces, all_restore_info, 
+                processing_image, all_processed_faces, all_restore_info, 
                 blend_softness, enable_color_correction, 1.0
             )
             
             processed_face_output = self.create_combined_face_output(all_processed_faces, processing_resolution)
-            side_by_side = self.create_unified_comparison(original_image, all_processed_faces, all_restore_info, processing_resolution)
-            final_mask = self.create_unified_mask(all_restore_info, original_image)
+            side_by_side = self.create_unified_comparison(processing_image, all_processed_faces, all_restore_info, processing_resolution)
+            final_mask = self.create_unified_mask(all_restore_info, processing_image)
             
             if enable_vertical_flip:
                 final_image = torch.flip(final_image, dims=[1])

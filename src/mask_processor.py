@@ -107,9 +107,7 @@ class ForbiddenVisionMaskProcessor:
             m_x1, m_x2 = final_coords[1].min(), final_coords[1].max()
             center_x, center_y = (m_x1 + m_x2) / 2, (m_y1 + m_y2) / 2
             
-            # --- START: SEPARATED CROPPING LOGIC ---
             if is_adaptive:
-                # --- NEW: Aspect-Ratio-Aware Cropping Logic (ADAPTIVE MODE) ---
                 mask_w, mask_h = m_x2 - m_x1, m_y2 - m_y1
                 target_aspect_ratio = target_wh[0] / target_wh[1]
                 
@@ -137,7 +135,6 @@ class ForbiddenVisionMaskProcessor:
                 crop_y1 = int(center_y - final_crop_h / 2)
             
             else:
-                # --- OLD: Simple Square Cropping Logic (FIXED MODE) ---
                 width, height = m_x2 - m_x1, m_y2 - m_y1
                 base_size = max(width, height)
                 padded_size = int(base_size * crop_padding)
@@ -147,12 +144,10 @@ class ForbiddenVisionMaskProcessor:
                 crop_x1 = int(center_x - final_crop_w / 2)
                 crop_y1 = int(center_y - final_crop_h / 2)
 
-            # Clamp coordinates to the image boundaries to prevent errors
             crop_x1 = max(0, min(crop_x1, w - int(final_crop_w)))
             crop_y1 = max(0, min(crop_y1, h - int(final_crop_h)))
             crop_x2 = crop_x1 + int(final_crop_w)
             crop_y2 = crop_y1 + int(final_crop_h)
-            # --- END: SEPARATED CROPPING LOGIC ---
             
             cropped_image = image_uint8[crop_y1:crop_y2, crop_x1:crop_x2]
             cropped_sampler_mask = blend_mask[crop_y1:crop_y2, crop_x1:crop_x2]
@@ -203,13 +198,11 @@ class ForbiddenVisionMaskProcessor:
             return self.create_empty_outputs(image_tensor, target_wh)
 
     def create_empty_outputs(self, image_tensor, target_size):
-        # NEW: Handle both tuple (adaptive) and int (fixed) resolution inputs
         if isinstance(target_size, int):
             target_wh = (target_size, target_size)
         else:
-            target_wh = target_size # This is now a (width, height) tuple
+            target_wh = target_size
 
-        # NEW: Create tensors with correct (h, w) dimensions from the tuple
         empty_face = torch.zeros((1, target_wh[1], target_wh[0], 3), dtype=torch.float32)
         empty_mask = torch.zeros((1, target_wh[1], target_wh[0]), dtype=torch.float32)
         

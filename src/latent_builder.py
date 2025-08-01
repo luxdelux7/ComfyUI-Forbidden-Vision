@@ -32,7 +32,6 @@ class LatentBuilder:
                 "negative": ("CONDITIONING",),
                 "self_correction": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),
                 
-                # --- CFG DECAY INPUTS ---
                 "cfg_decay_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "cfg_decay_start_at": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "cfg_decay_curve": (["Smooth", "Linear", "Slow Start", "Fast Start"], {"default": "Smooth"}),
@@ -68,57 +67,45 @@ class LatentBuilder:
         device = model_management.get_torch_device()
         latent_tensor = torch.zeros([batch_size, 4, height // 8, width // 8], device=device)
         
-        # Create a blank, black image tensor to use as a fallback output.
-        # This prevents downstream nodes from crashing if no VAE is connected.
         blank_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32, device=device)
         
         final_latent = {"samples": latent_tensor}
 
         try:
             if cfg_decay_strength > 0:
-                print(f"🧠 Generating at {width}x{height} with CFG Decay Schedule. Strength: {cfg_decay_strength:.2f}, Curve: {cfg_decay_curve}")
                 result_tensor = self.adaptive_cfg_sampling(model, positive, negative, latent_tensor, seed, steps, cfg, sampler_name, scheduler, device, cfg_decay_strength, cfg_decay_start_at, cfg_decay_curve)
             else:
-                print(f"🎨 Generating at {width}x{height} with Standard Static CFG: {cfg:.2f}")
                 result_tensor = self.standard_sampling(model, positive, negative, latent_tensor, seed, steps, cfg, sampler_name, scheduler, device)
             
             initial_latent = {"samples": result_tensor}
             final_latent = initial_latent
 
             if self_correction:
-                print("✨ Applying a final, low-denoise polish pass...")
                 sampler_info = {
                     "sampler_name": sampler_name,
                     "scheduler": scheduler,
                     "seed": seed + 1
                 }
                 polished_latent = self._final_polish_pass(initial_latent, model, positive, negative, sampler_info)
-                print("✅ Polish complete.")
                 final_latent = polished_latent
             
             if vae is not None:
-                print("Decoding latent to image...")
                 image_out = vae.decode(final_latent["samples"])
-                print("✅ Decode complete.")
                 return (final_latent, image_out,)
             else:
-                # If no VAE is provided, return the generated latent and the blank image.
                 return (final_latent, blank_image,)
 
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
             print(f"❌ Error during sampling: {e}")
-            import traceback
-            traceback.print_exc()
-            # On any error, return the initial empty latent and the blank image.
             return ({"samples": latent_tensor}, blank_image,)
         
     def prepare_conditioning(self, conditioning, device):
         if not conditioning: return []
         prepared = []
         for cond_item in conditioning:
-            model_management.throw_exception_if_processing_interrupted() # Check for interruption
+            model_management.throw_exception_if_processing_interrupted()
             cond_tensor = cond_item[0].to(device)
             cond_dict = {k: v.to(device) if torch.is_tensor(v) else v for k, v in cond_item[1].items()}
             prepared.append([cond_tensor, cond_dict])
@@ -184,7 +171,6 @@ class LatentBuilder:
         sampler = comfy.samplers.KSampler(model, steps=steps, device=device, sampler=sampler_name, scheduler=scheduler, denoise=1.0, model_options=model.model_options)
         sigmas = sampler.sigmas
         
-        # Pass the decay_curve parameter to the function that creates the scheduled model
         scheduled_model = self.create_adaptive_scheduled_model(model, base_cfg, steps, sigmas, decay_strength, decay_start_at, decay_curve)
         sampler.model = scheduled_model
         
@@ -207,7 +193,6 @@ class LatentBuilder:
             cond_pred = args["cond_denoised"]
             uncond_pred = args["uncond_denoised"]
             
-            # Pass the decay_curve parameter to the calculation function
             final_cfg = self.calculate_adaptive_cfg(current_step[0], total_steps, base_cfg, self.run_summary_data, decay_strength, decay_start_at, decay_curve)
             
             log_parts = [f"Step {current_step[0] + 1}/{total_steps}: CFG {base_cfg:.2f} → {final_cfg:.2f}"]
@@ -217,7 +202,6 @@ class LatentBuilder:
             log_parts.append(f"[μ={torch.mean(torch.abs(final_output)).item():.2f}, σ={torch.std(final_output).item():.2f}]")
             
             self.run_summary_data.setdefault("step_history", []).append(post_stats)
-            print(" | ".join(log_parts))
             
             current_step[0] += 1
             return args["input"] - final_output
@@ -236,7 +220,6 @@ class LatentBuilder:
             min_target_cfg = max(2.0, base_cfg / 2.5)
             end_cfg = base_cfg + (min_target_cfg - base_cfg) * decay_strength
             schedule_params["final_target_cfg"] = end_cfg
-            print(f"🚀 CFG Decay initiated at step {step + 1}/{total_steps}. Base: {base_cfg:.2f}, Target: {end_cfg:.2f} (Strength: {decay_strength:.2f})")
 
         end_cfg = schedule_params["final_target_cfg"]
         
@@ -249,20 +232,14 @@ class LatentBuilder:
         elif steps_into_decay > 0:
             progress = 1.0
 
-        # --- CURVE LOGIC WITH NEW NAMES ---
         eased_progress = progress
         if decay_curve == "Smooth":
-            # A gentle start and a gentle end (Sinusoidal)
             eased_progress = (math.cos(math.pi * progress) - 1) / -2.0
         elif decay_curve == "Slow Start":
-            # Starts slow, accelerates towards the end (Quadratic In)
             eased_progress = progress * progress
         elif decay_curve == "Fast Start":
-            # Starts fast, decelerates towards the end (Quadratic Out)
             eased_progress = 1 - (1 - progress) * (1 - progress)
-        # "Linear" requires no change
 
-        # Linearly interpolate from the base_cfg to the end_cfg using the *eased* progress.
         current_cfg = base_cfg + (end_cfg - base_cfg) * eased_progress
         
         return max(1.0, current_cfg)

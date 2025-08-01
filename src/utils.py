@@ -7,31 +7,54 @@ import yaml
 import comfy.model_management as model_management
 
 DEFAULT_CONFIG = {
-    'preferred_model_symbol': '🌟',
+    'preferred_model_symbol': '⭐',
     'preferred_models': {
         'upscaler': [
+            "4xArtFaces_realplksr_dysample.pth",
             "4x_NMKD-Siax_200k.pth",
             "4x-UltraSharp.pth",
             "4x_foolhardy_Remacri.pth",
             "4x-AnimeSharp.pth"
         ],
-        'bbox': [
+        'refiner_upscaler': [
+            "2xBHI_small_realplksr_small_pretrain.pth",
+            "4x-UltraSharp.pth",
+            "4x_NMKD-Siax_200k.pth",
+            "RealESRGAN_x4plus.pth",
+            "ESRGAN_4x.pth"
+        ],
+        'bbox_primary': [
+            "Anzhc20seg20v2%20y8n.pt",
             "face_yolov8n_v2.pt",
             "face_yolov8m.pt",
-            "yolov8x6_animeface.pt"
+            "yolov8x6_animeface.pt",
+            "yolov8n-face.pt"
         ],
-        'segmentation': [
-            "preferred_sam_model.pth",
-            "preferred_yoloseg_model.pt",
-            "backup_seg_model.pt"
+        'bbox_secondary': [
+            "Anzhc20seg20v3%20y11n.pt",
+            "face_yolov8m.pt",
+            "yolov8x6_animeface.pt", 
+            "face_yolov8n_v2.pt",
+            "yolov8s-face.pt"
+        ],
+        'segmentation_primary': [
+            "Anzhc20seg20v2%20y8n.pt",
+            "sam_vit_l_0b3195.pth",
+            "yolov8n-seg.pt",
+            "yolov8s-seg.pt"
+        ],
+        'segmentation_secondary': [
+            "Anzhc20seg20v3%20y11n.pt",
+            "yolov8s-seg.pt",
+            "yolov8m-seg.pt",
+            "yolov8l-seg.pt"
         ]
     }
 }
 
 def load_model_preferences():
-    """Load model preferences from YAML config file"""
+
     try:
-        # Get the plugin root directory (parent of src)
         plugin_root = os.path.dirname(os.path.dirname(__file__))
         config_path = os.path.join(plugin_root, "model_choice.yaml")
         
@@ -39,20 +62,17 @@ def load_model_preferences():
             with open(config_path, 'r', encoding='utf-8') as f:
                 user_config = yaml.safe_load(f)
                 
-            # Merge with defaults
+                
+                
             config = DEFAULT_CONFIG.copy()
             if user_config:
-                if 'preferred_model_symbol' in user_config:
-                    config['preferred_model_symbol'] = user_config['preferred_model_symbol']
                 if 'preferred_models' in user_config:
                     for category, models in user_config['preferred_models'].items():
                         if category in config['preferred_models']:
                             config['preferred_models'][category] = models
                             
-            print(f"[Forbidden Vision] Loaded model preferences from {config_path}")
             return config
         else:
-            print(f"[Forbidden Vision] No custom config found, using defaults")
             return DEFAULT_CONFIG
             
     except Exception as e:
@@ -60,11 +80,10 @@ def load_model_preferences():
         return DEFAULT_CONFIG
 
 def clean_model_name(model_name):
-    """Remove symbol prefixes from model names"""
+
     if not model_name:
         return model_name
     
-    # Remove any emoji symbols at the start
     symbols = ['⭐', '🌟', '✨', '💎', '🔥', '⚡', '🎯']
     cleaned = model_name
     for symbol in symbols:
@@ -131,7 +150,8 @@ def find_model_path(model_name, model_type):
 def get_yolo_models():
     config = load_model_preferences()
     preferred_symbol = config['preferred_model_symbol']
-    preferred_bbox_models = config['preferred_models']['bbox']
+    preferred_bbox_primary = config['preferred_models']['bbox_primary']
+    preferred_bbox_secondary = config['preferred_models']['bbox_secondary']
     
     search_paths = [
         os.path.join(folder_paths.models_dir, "ultralytics", "face"),
@@ -154,18 +174,17 @@ def get_yolo_models():
     
     final_list = []
     
-    # Add face models first (no symbol, but prioritized by position)
     face_models_sorted = sorted(list(face_models))
     for model in face_models_sorted:
         final_list.append(model)
     
-    # Add preferred models with symbol (if not already in face models)
-    for preferred_model in preferred_bbox_models:
+    all_preferred_bbox = list(preferred_bbox_primary) + list(preferred_bbox_secondary)
+    
+    for preferred_model in all_preferred_bbox:
         if preferred_model in other_models and preferred_model not in face_models:
             final_list.append(f"{preferred_symbol} {preferred_model}")
             other_models.remove(preferred_model)
     
-    # Add remaining models
     remaining_other = sorted(list(other_models - face_models))
     final_list.extend(remaining_other)
 
@@ -174,63 +193,90 @@ def get_yolo_models():
 def get_sam_models():
     config = load_model_preferences()
     preferred_symbol = config['preferred_model_symbol']
-    preferred_seg_models = config['preferred_models']['segmentation']
+    preferred_seg_primary = config['preferred_models']['segmentation_primary']
+    preferred_seg_secondary = config['preferred_models']['segmentation_secondary']
     
-    # Directories to search
-    face_paths = [
-        os.path.join(folder_paths.models_dir, "ultralytics", "face"),
-    ]
+    face_paths = [os.path.join(folder_paths.models_dir, "ultralytics", "face")]
     sam_paths = [
         os.path.join(folder_paths.models_dir, "sams"),
         os.path.join(folder_paths.models_dir, "sam"),
         os.path.join(folder_paths.models_dir, "segment_anything"),
     ]
-    yolo_seg_paths = [
-        os.path.join(folder_paths.models_dir, "ultralytics", "segm"),
-    ]
+    yolo_seg_paths = [os.path.join(folder_paths.models_dir, "ultralytics", "segm")]
     
     face_models = set()
     for path in face_paths:
         if os.path.isdir(path):
-            for f in os.listdir(path):
-                if f.endswith(".pt"):
-                    face_models.add(f)
-    
+            face_models.update(f for f in os.listdir(path) if f.endswith(".pt"))
+            
     yolo_seg_models = set()
     for path in yolo_seg_paths:
         if os.path.isdir(path):
-            for f in os.listdir(path):
-                if f.endswith(".pt"):
-                    yolo_seg_models.add(f)
-    
+            yolo_seg_models.update(f for f in os.listdir(path) if f.endswith(".pt"))
+
     sam_models = set()
     for path in sam_paths:
         if os.path.isdir(path):
-            for f in os.listdir(path):
-                if f.endswith(".pth"):
-                    sam_models.add(f)
+            sam_models.update(f for f in os.listdir(path) if f.endswith(".pth"))
 
     final_list = ["None"]
     
-    # Add face models first (no symbol, but prioritized by position)
-    face_models_sorted = sorted(list(face_models))
-    for model in face_models_sorted:
-        final_list.append(model)
+    all_preferred_seg = list(preferred_seg_primary) + list(preferred_seg_secondary)
+    for face_model in sorted(list(face_models)):
+        if face_model in all_preferred_seg:
+            final_list.append(f"{preferred_symbol} {face_model}")
+        else:
+            final_list.append(face_model)
     
-    # Add preferred models with symbol (if not already in face models)
-    all_other_models = yolo_seg_models | sam_models
-    for preferred_model in preferred_seg_models:
-        if preferred_model in all_other_models and preferred_model not in face_models:
+    available_models = (yolo_seg_models | sam_models) - face_models
+    
+    for preferred_model in all_preferred_seg:
+        if preferred_model in available_models:
             final_list.append(f"{preferred_symbol} {preferred_model}")
-            all_other_models.remove(preferred_model)
+            available_models.discard(preferred_model)
     
-    # Add remaining YOLO-seg models
-    remaining_yolo_seg = sorted(list(yolo_seg_models - face_models))
+    remaining_yolo_seg = sorted([m for m in available_models if m in yolo_seg_models])
+    remaining_sam = sorted([m for m in available_models if m in sam_models])
+    
     final_list.extend(remaining_yolo_seg)
-    
-    # Add remaining SAM models
-    remaining_sam = sorted(list(sam_models))
     final_list.extend(remaining_sam)
+
+    return final_list
+
+def get_yolo_seg_models_only():
+    config = load_model_preferences()
+    preferred_symbol = config['preferred_model_symbol']
+    preferred_seg_secondary = config['preferred_models']['segmentation_secondary']
+    
+    face_paths = [os.path.join(folder_paths.models_dir, "ultralytics", "face")]
+    yolo_seg_paths = [os.path.join(folder_paths.models_dir, "ultralytics", "segm")]
+    
+    face_models = set()
+    for path in face_paths:
+        if os.path.isdir(path):
+            face_models.update(f for f in os.listdir(path) if f.endswith(".pt"))
+
+    yolo_seg_models = set()
+    for path in yolo_seg_paths:
+        if os.path.isdir(path):
+            yolo_seg_models.update(f for f in os.listdir(path) if f.endswith(".pt"))
+
+    final_list = ["None"]
+    
+    for face_model in sorted(list(face_models)):
+        if face_model in preferred_seg_secondary:
+            final_list.append(f"{preferred_symbol} {face_model}")
+        else:
+            final_list.append(face_model)
+    
+    available_models = yolo_seg_models - face_models
+    
+    for preferred_model in preferred_seg_secondary:
+        if preferred_model in available_models:
+            final_list.append(f"{preferred_symbol} {preferred_model}")
+            available_models.discard(preferred_model)
+    
+    final_list.extend(sorted(list(available_models)))
 
     return final_list
 
@@ -249,61 +295,32 @@ def get_ordered_upscaler_model_list():
     final_list = fast_options.copy()
     
     if all_models:
-        # Add preferred models with symbol
         remaining_models = set(all_models)
         for preferred_model in preferred_upscaler_models:
             if preferred_model in remaining_models:
                 final_list.append(f"{preferred_symbol} {preferred_model}")
                 remaining_models.remove(preferred_model)
         
-        # Add remaining models
         final_list.extend(sorted(list(remaining_models)))
     
     return final_list
 
-def get_yolo_seg_models_only():
+def get_refiner_upscaler_models():
     config = load_model_preferences()
     preferred_symbol = config['preferred_model_symbol']
-    preferred_seg_models = config['preferred_models']['segmentation']
+    preferred_refiner_models = config['preferred_models']['refiner_upscaler']
     
-    face_paths = [
-        os.path.join(folder_paths.models_dir, "ultralytics", "face"),
-    ]
-    yolo_seg_paths = [
-        os.path.join(folder_paths.models_dir, "ultralytics", "segm"),
-    ]
+    all_models = folder_paths.get_filename_list("upscale_models") or []
     
-    face_models = set()
-    for path in face_paths:
-        if os.path.isdir(path):
-            for f in os.listdir(path):
-                if f.endswith(".pt"):
-                    face_models.add(f)
+    final_list = ["Simple: Bicubic (Standard)"]
     
-    yolo_seg_models = set()
-    for path in yolo_seg_paths:
-        if os.path.isdir(path):
-            for f in os.listdir(path):
-                if f.endswith(".pt"):
-                    yolo_seg_models.add(f)
-
-    final_list = ["None"]
+    if all_models:
+        remaining_models = set(all_models)
+        for preferred_model in preferred_refiner_models:
+            if preferred_model in remaining_models:
+                final_list.append(f"{preferred_symbol} {preferred_model}")
+                remaining_models.remove(preferred_model)
+        
+        final_list.extend(sorted(list(remaining_models)))
     
-    # Add face models first (no symbol, but prioritized by position)
-    face_models_sorted = sorted(list(face_models))
-    for model in face_models_sorted:
-        final_list.append(model)
-    
-    # Add preferred YOLO-seg models with symbol (if not already in face models)
-    for preferred_model in preferred_seg_models:
-        if (preferred_model.endswith('.pt') and 
-            preferred_model in yolo_seg_models and 
-            preferred_model not in face_models):
-            final_list.append(f"{preferred_symbol} {preferred_model}")
-            yolo_seg_models.remove(preferred_model)
-    
-    # Add remaining YOLO-seg models
-    remaining_yolo_seg = sorted(list(yolo_seg_models - face_models))
-    final_list.extend(remaining_yolo_seg)
-
     return final_list

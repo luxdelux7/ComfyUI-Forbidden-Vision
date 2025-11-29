@@ -19,54 +19,35 @@ Forbidden Vision uses **custom detection engines trained on a manually curated d
 
 <br>
 
-<table>
-  <tr>
-    <td width="45%" valign="top">
-      <h3>From Weak Base to Finished Render</h3>
-      <p>Forbidden Vision turns weak inputs into quality final generations.</p>
-      <p><strong>The pipeline in action:</strong></p>
-      <p>
-        <b>1. Base:</b> A weak, underlit generation.<br>
-        <b>2. Refiner:</b> Corrects exposure, tone, colors, and adds depth of field.<br>
-        <b>3. Fixer:</b> Drastically reshapes the face (0.8 denoise) seamlessly.
-      </p>
-    </td>
-    <td width="55%" valign="top">
-      <img src="./images/loop_image.webp" alt="Fixer Example" width="100%" style="border-radius: 6px;">
-    </td>
-  </tr>
-</table>
-
-<br>
+<div align="center">
+  <img src="./images/loop_image.webp" alt="Fixer Loop Example" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
+  <p>
+    <em>From a weak, underlit base, the Refiner corrects tone and exposure, preparing the image for the Fixer to drastically reshape the face at 0.8 denoise.</em>
+  </p>
+</div>
 
 <br>
 
 ## ✨ What's Included
 
-<table>
-  <tr>
-    <td width="55%" valign="top">
-      <a href="./images/nodes.webp" target="_blank">
-        <img src="./images/nodes.webp" alt="Suite Overview" width="100%" style="border-radius: 6px;">
-      </a>
-    </td>
-    <td width="45%" valign="top">
-      <p><strong>The Core Suite</strong></p>
-      <ul>
-        <li><strong>Fixer</strong> – Face detection, restoration, and context-aware inpainting.</li>
-        <li><strong>Refiner</strong> – Automatic enhancement with tone correction, upscaling, and effects.</li>
-        <li><strong>Builder</strong> – First-pass sampling with adaptive CFG and self-correction.</li>
-      </ul>
-      <p><strong>Versatile Tools</strong></p>
-      <ul>
-        <li><strong>Inpainter</strong> – The Fixer’s blending engine in a manual inpainting node.</li>
-        <li><strong>Rebuilder</strong> – Basic ksampler with integrated VAE decoding.</li>
-        <li><strong>Fixer Mask</strong> – Outputs masks from the detection models.</li>
-        <li><strong>Settings</strong> – Simple output for samplers/schedulers.</li>
-      </ul>
-    </td>
-  </tr>
-</table>
+<div align="center">
+  <a href="./images/nodes.webp" target="_blank">
+    <img src="./images/nodes.webp" alt="Suite Overview" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
+  </a>
+</div>
+
+<br>
+
+### The Core Suite
+*   **Fixer** – Face detection, restoration, and context-aware inpainting.
+*   **Refiner** – Automatic enhancement with tone correction, upscaling, and effects.
+*   **Builder** – First-pass sampling with adaptive CFG and self-correction.
+
+### Versatile Tools
+*   **Inpainter** – The Fixer’s blending engine in a manual inpainting node.
+*   **Rebuilder** – Basic ksampler with integrated VAE decoding.
+*   **Fixer Mask** – Outputs masks from the detection models.
+*   **Settings** – Simple output for samplers/schedulers.
 
 ## 🎭 Fixer Node
 

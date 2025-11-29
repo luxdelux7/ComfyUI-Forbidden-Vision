@@ -19,56 +19,54 @@ Forbidden Vision uses **custom detection engines trained on a manually curated d
 
 <br>
 
-<div style="display: flex; justify-content: center; align-items: center; gap: 20px; flex-wrap: wrap;">
+<table>
+  <tr>
+    <td width="45%" valign="top">
+      <h3>From Weak Base to Finished Render</h3>
+      <p>Forbidden Vision turns weak inputs into quality final generations.</p>
+      <p><strong>The pipeline in action:</strong></p>
+      <p>
+        <b>1. Base:</b> A weak, underlit generation.<br>
+        <b>2. Refiner:</b> Corrects exposure, tone, colors, and adds depth of field.<br>
+        <b>3. Fixer:</b> Drastically reshapes the face (0.8 denoise) seamlessly.
+      </p>
+    </td>
+    <td width="55%" valign="top">
+      <img src="./images/loop_image.webp" alt="Fixer Example" width="100%" style="border-radius: 6px;">
+    </td>
+  </tr>
+</table>
 
-  <div style="min-width: 250px; flex: 1;">
-    <h3>From Weak Base to Finished Render</h3>
-    <p>
-      Forbidden Vision turns weak inputs into quality final generations.
-    </p>
-    <p style="line-height: 1.6;">
-      <strong>The pipeline in action:</strong><br>
-      <b>1. Base:</b> A weak, underlit generation.<br>
-      <b>2. Refiner:</b> Corrects exposure, tone, colors, and adds depth of field.<br>
-      <b>3. Fixer:</b> Drastically reshapes the face (0.8 denoise) seamlessly.
-    </p>
-  </div>
-
-  <div style="flex: 1.5; min-width: 300px;">
-    <img src="./images/loop_image.webp" alt="Fixer Example" style="width: 100%; height: auto; border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
-  </div>
-
-</div>
+<br>
 
 <br>
 
 ## ✨ What's Included
 
-<div style="display: flex; justify-content: center; align-items: flex-start; gap: 20px; flex-wrap: wrap;">
-
-  <div style="flex: 1.6; min-width: 300px;">
-    <a href="./images/nodes.webp" target="_blank">
-      <img src="./images/nodes.webp" alt="Suite Overview" style="width: 100%; height: auto; border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
-    </a>
-  </div>
-
-  <div style="flex: 1; min-width: 250px;">
-    <p><strong>The Core Suite</strong></p>
-    <ul>
-      <li><strong>Fixer</strong> – Face detection, restoration, and context-aware inpainting.</li>
-      <li><strong>Refiner</strong> – Automatic enhancement with tone correction, upscaling, and effects.</li>
-      <li><strong>Builder</strong> – First-pass sampling with adaptive CFG and self-correction.</li>
-    </ul>
-    <p><strong>Additional Tools</strong></p>
-    <ul>
-      <li><strong>Inpainter</strong> – The Fixer’s blending engine in a manual inpainting node.</li>
-      <li><strong>Rebuilder</strong> – Basic ksampler with integrated VAE decoding.</li>
-      <li><strong>Fixer Mask</strong> – Outputs masks from the detection models.</li>
-      <li><strong>Settings</strong> – Simple output for samplers/schedulers.</li>
-    </ul>
-  </div>
-
-</div>
+<table>
+  <tr>
+    <td width="55%" valign="top">
+      <a href="./images/nodes.webp" target="_blank">
+        <img src="./images/nodes.webp" alt="Suite Overview" width="100%" style="border-radius: 6px;">
+      </a>
+    </td>
+    <td width="45%" valign="top">
+      <p><strong>The Core Suite</strong></p>
+      <ul>
+        <li><strong>Fixer</strong> – Face detection, restoration, and context-aware inpainting.</li>
+        <li><strong>Refiner</strong> – Automatic enhancement with tone correction, upscaling, and effects.</li>
+        <li><strong>Builder</strong> – First-pass sampling with adaptive CFG and self-correction.</li>
+      </ul>
+      <p><strong>Versatile Tools</strong></p>
+      <ul>
+        <li><strong>Inpainter</strong> – The Fixer’s blending engine in a manual inpainting node.</li>
+        <li><strong>Rebuilder</strong> – Basic ksampler with integrated VAE decoding.</li>
+        <li><strong>Fixer Mask</strong> – Outputs masks from the detection models.</li>
+        <li><strong>Settings</strong> – Simple output for samplers/schedulers.</li>
+      </ul>
+    </td>
+  </tr>
+</table>
 
 ## 🎭 Fixer Node
 

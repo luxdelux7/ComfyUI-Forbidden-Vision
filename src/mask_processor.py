@@ -24,7 +24,6 @@ class ForbiddenVisionMaskProcessor:
             hole_threshold = min(150, max(30, int(total_pixels * 0.001)))
             filled_mask_bool = remove_small_holes(cleaned_mask_bool, area_threshold=hole_threshold)
             
-            
             rows = np.any(filled_mask_bool, axis=1)
             cols = np.any(filled_mask_bool, axis=0)
             if not np.any(rows) or not np.any(cols):
@@ -50,7 +49,43 @@ class ForbiddenVisionMaskProcessor:
         except Exception as e:
             print(f"Warning: Error during final mask polishing: {e}. Returning unpolished mask.")
             return mask_np
-                
+
+    def _get_crop_coords_from_mask(self, mask_tensor, crop_padding):
+        """Extract crop coordinates from mask tensor"""
+        try:
+            mask_np = mask_tensor.squeeze().cpu().numpy()
+            coords = np.where(mask_np > 0.5)
+            
+            if len(coords[0]) == 0:
+                return None
+            
+            y_min, y_max = coords[0].min(), coords[0].max()
+            x_min, x_max = coords[1].min(), coords[1].max()
+            
+            h, w = mask_np.shape
+            padding_x = int((x_max - x_min) * (crop_padding - 1.0) / 2)
+            padding_y = int((y_max - y_min) * (crop_padding - 1.0) / 2)
+            
+            crop_x1 = max(0, x_min - padding_x)
+            crop_y1 = max(0, y_min - padding_y)
+            crop_x2 = min(w, x_max + padding_x)
+            crop_y2 = min(h, y_max + padding_y)
+            
+            return [crop_x1, crop_y1, crop_x2, crop_y2]
+            
+        except Exception as e:
+            print(f"Error getting crop coords from mask: {e}")
+            return None
+
+    def _process_mask_for_sampling(self, mask, mask_expansion):
+        """Process mask for inpainting sampling"""
+        if mask_expansion > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
+                                            (mask_expansion*2+1, mask_expansion*2+1))
+            mask = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
+        
+        return mask.astype(np.float32)
+           
     def process_and_crop(self, image_tensor, mask_tensor, crop_padding, processing_resolution, mask_expansion, enable_pre_upscale=False, upscaler_model_name=None, upscaler_loader_callback=None, upscaler_run_callback=None):
         try:
             check_for_interruption()

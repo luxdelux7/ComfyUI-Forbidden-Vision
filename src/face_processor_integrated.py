@@ -14,7 +14,7 @@ import kornia
 import re
 from .face_detector import ForbiddenVisionFaceDetector
 from .mask_processor import ForbiddenVisionMaskProcessor
-from .utils import check_for_interruption, get_yolo_models, get_sam_models, get_yolo_seg_models_only, get_ordered_upscaler_model_list, ensure_model_directories, load_model_preferences, clean_model_name
+from .utils import check_for_interruption, get_ordered_upscaler_model_list, ensure_model_directories, clean_model_name
 
 class ExclusionProcessor:
     def process(self, text, exclusions):
@@ -28,77 +28,17 @@ class ExclusionProcessor:
         text = re.sub(r'(,\s*)+', ', ', text)
         text = text.strip(' ,')
         return text
+
 class ForbiddenVisionFaceProcessorIntegrated:
 
-    SDXL_RESOLUTIONS = {
-        "640x1536": (640, 1536),
-        "768x1344": (768, 1344),
-        "832x1216": (832, 1216),
-        "896x1152": (896, 1152),
-        "1024x1024": (1024, 1024),
-        "1152x896": (1152, 896),
-        "1216x832": (1216, 832),
-        "1344x768": (1344, 768),
-        "1536x640": (1536, 640),
-    }
 
     @classmethod
     def INPUT_TYPES(s):
-                
-        config = load_model_preferences()
-        
-        yolo_models = get_yolo_models()
-        sam_models = get_sam_models()
-        yolo_seg_models_only = get_yolo_seg_models_only()
         upscaler_models = get_ordered_upscaler_model_list()
         
-        def get_preferred_default(model_list, preferred_list, fallback=None):
-            # First, iterate through the user's preferred models from the config
-            for preferred_name in preferred_list:
-                # Then, iterate through the actual list of models available in the dropdown
-                for model_in_list in model_list:
-                    # Clean the model name from the list (to remove the symbol)
-                    cleaned_model_in_list = clean_model_name(model_in_list)
-                    # If the cleaned name matches the user's preference, we found our default
-                    if cleaned_model_in_list == preferred_name:
-                        # Return the model name *with* its symbol intact
-                        return model_in_list
-            
-            # If no preferred models were found in the list, use the fallback
-            if fallback and fallback in model_list:
-                return fallback
-            
-            # If still no match, return the first item in the list
-            return model_list[0] if model_list else "None Found"
-        
-        default_upscaler = get_preferred_default(
-            upscaler_models, 
-            config['preferred_models']['upscaler'], 
-            "Fast 4x (Lanczos)"
-        )
-
-        default_bbox = get_preferred_default(
-            yolo_models, 
-            config['preferred_models']['bbox_primary']
-        )
-
-        default_bbox_b = get_preferred_default(
-            ["None"] + yolo_models, 
-            config['preferred_models']['bbox_secondary'], 
-            "None"
-        )
-
-        default_seg = get_preferred_default(
-            sam_models, 
-            config['preferred_models']['segmentation_primary'], 
-            "None"
-        )
-
-        default_seg_b = get_preferred_default(
-            yolo_seg_models_only, 
-            config['preferred_models']['segmentation_secondary'], 
-            "None"
-        )
+        default_upscaler = "Fast 4x (Lanczos)"
+        if "Fast 4x (Lanczos)" not in upscaler_models and upscaler_models:
+            default_upscaler = upscaler_models[0]
         
         return {
             "required": {
@@ -114,36 +54,35 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 "denoise_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 
-                "face_selection": ("INT", {"default": 0, "min": 0, "max": 20, "step": 1, "tooltip": "0=All faces, 1=1st face, etc. Used by both mask input and internal detector."}),
-                "processing_resolution": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64, "tooltip": "The resolution for processing. If adaptive resolution is on, this acts as a target area."}),
-                "use_adaptive_resolution": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Enable to automatically select the best SDXL resolution based on face aspect ratio."}),
+                "face_selection": ("INT", {"default": 0, "min": 0, "max": 20, "step": 1, "tooltip": "0=All faces, 1=1st face, etc."}),
+                "detection_confidence": ("FLOAT", {"default": 0.75, "min": 0.1, "max": 1.0, "step": 0.1, "tooltip": "Face detection confidence threshold."}),
+                "manual_rotation": (["None", "90° CW", "90° CCW", "180°"], {"default": "None", "tooltip": "Manually rotate face crop before processing"}),
+                "processing_resolution": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64, "tooltip": "The resolution for processing."}),
+
                 "enable_pre_upscale": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Enable to upscale small faces with an AI model before processing."}),
-                "upscaler_model": (upscaler_models, {"default": default_upscaler, "tooltip": "The model used for pre-upscaling small faces. Only active if 'enable_pre_upscale' is on."}),
-                "crop_padding": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 2.0, "step": 0.1, "tooltip": "Padding added to the mask's bounding box before inpaint."}),
+                "upscaler_model": (upscaler_models, {"default": default_upscaler, "tooltip": "The model used for pre-upscaling small faces."}),
+                "crop_padding": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 3.0, "step": 0.1, "tooltip": "Padding added to the face region before inpaint."}),
                 
-                "face_positive_prompt": ("STRING", {"multiline": True, "default": "", "placeholder": "Prepend the input positive prompt with new tags"}),
+                "face_positive_prompt": ("STRING", {"multiline": True, "default": "", "placeholder": "Additional positive prompt for face generation"}),
                 "replace_positive_prompt": ("BOOLEAN", {"default": False}),
-                "face_negative_prompt": ("STRING", {"multiline": True, "default": "", "placeholder": "Prepend the input negative prompt with new tags"}),
+                "face_negative_prompt": ("STRING", {"multiline": True, "default": "", "placeholder": "Additional negative prompt for face generation"}),
                 "replace_negative_prompt": ("BOOLEAN", {"default": False}),   
                 "exclusions": ("STRING", {"multiline": True, "default": "", "placeholder": "e.g. glasses, scar, wrinkles\nTags to remove from main prompt for face generation...", "tooltip": "Words/tags to remove from the main prompt specifically for the face processing step."}),
 
                 "blend_softness": ("INT", {"default": 8, "min": 0, "max": 200, "step": 1}),
-                "mask_expansion": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+                "mask_expansion": ("INT", {"default": 2, "min": 0, "max": 100, "step": 1}),
                 "sampling_mask_blur_size": ("INT", {"default": 21, "min": 1, "max": 101, "step": 2}),
                 "sampling_mask_blur_strength": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 6.0, "step": 0.1}),
-                "enable_vertical_flip": ("BOOLEAN", {"default": False}),
-                "enable_color_correction": ("BOOLEAN", {"default": True}),
                 
-                "bbox_model": (yolo_models, {"default": default_bbox, "tooltip": "Internal BBOX detector model (YOLO). Used if 'mask' is not connected."}),
-                "bbox_model_B": (["None"] + yolo_models, {"default": default_bbox_b, "tooltip": "Optional second BBOX detector (YOLO). Runs with the first for more robust detection."}),
-                "yolo_seg_model": (sam_models, {"default": default_seg, "tooltip": "Primary masking model. Includes YOLO-seg (fast, 6MB) and SAM models (slower, robust). Used if 'mask' is not connected."}),
-                "yolo_seg_model_B": (yolo_seg_models_only, {"default": default_seg_b, "tooltip": "Optional second YOLO-seg model for ensemble masking. Only YOLO-seg models available."}),
+                "enable_color_correction": ("BOOLEAN", {"default": True}),
+                "enable_segmentation": ("BOOLEAN", {"default": True, "tooltip": "Use AI segmentation. If disabled, creates oval masks."}),
+                "enable_differential_diffusion": ("BOOLEAN", {"default": True, "tooltip": "Better blending. At high noise, the mask allows structure changes; at low noise, it locks the background."}),
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "Optional image input. If latent is also provided, latent will be used."}),
                 "latent": ("LATENT", {"tooltip": "Optional latent input. Will be decoded for processing."}),
                 "mask": ("MASK", {"tooltip": "Optional: Face mask for processing. If connected, internal detection is skipped."}),
-                "clip": ("CLIP", {"tooltip": "Optional: Required only if using face prompts."}),
+                "clip": ("CLIP", {"tooltip": "Optional: Required only if using face prompts."}),                
             }
         }
 
@@ -152,22 +91,53 @@ class ForbiddenVisionFaceProcessorIntegrated:
     FUNCTION = "process_face_complete"
     CATEGORY = "Forbidden Vision"
    
-    
-    
     def __init__(self):
         ensure_model_directories()
         self.face_detector = ForbiddenVisionFaceDetector()
         self.mask_processor = ForbiddenVisionMaskProcessor()
-        self.last_sampling_key = None
-        self.last_sampling_result = None
+
         self.upscaler_model = None
         self.upscaler_model_name = None
     
+    def differential_diffusion_function(self, sigma, denoise_mask, extra_options):
+    
+        try:
+            model = extra_options["model"]
+            step_sigmas = extra_options["sigmas"]
+
+            inner_model = getattr(model, "inner_model", model)
+
+            sampling = inner_model.model_sampling
+
+            sigma_to = sampling.sigma_min
+            if step_sigmas[-1] > sigma_to:
+                sigma_to = step_sigmas[-1]
+            sigma_from = step_sigmas[0]
+
+            ts_from = sampling.timestep(sigma_from)
+            ts_to = sampling.timestep(sigma_to)
+            current_ts = sampling.timestep(sigma[0])
+
+            threshold = (current_ts - ts_to) / (ts_from - ts_to)
+
+            binary_mask = (denoise_mask >= threshold).to(denoise_mask.dtype)
+
+            strength = 1.0
+
+            if strength and strength < 1.0:
+                blended_mask = strength * binary_mask + (1.0 - strength) * denoise_mask
+                return blended_mask
+            else:
+                return binary_mask
+
+        except Exception as e:
+            print(f"[ForbiddenVision] Differential diffusion mask error: {e}")
+            return denoise_mask
 
     def load_upscaler_model(self, model_name):
         clean_model_name_val = clean_model_name(model_name)
         
-        if clean_model_name_val in ["Fast 4x (Bicubic AA)", "Fast 4x (Lanczos)"]:
+        if clean_model_name_val in ["Fast 4x (Bicubic AA)", "Fast 4x (Lanczos)", "Fast 2x (Bicubic AA)", "Fast 2x (Lanczos)"]:
             self.upscaler_model = None
             self.upscaler_model_name = clean_model_name_val
             return True
@@ -204,13 +174,18 @@ class ForbiddenVisionFaceProcessorIntegrated:
         upscaler_model_name = getattr(self, 'upscaler_model_name', None)
         
         if upscaler_model_name == "Fast 4x (Bicubic AA)":
-            return self.fast_upscale_bicubic(image_np_uint8)
+            return self.fast_upscale_bicubic(image_np_uint8, scale=4)
         elif upscaler_model_name == "Fast 4x (Lanczos)":
-            return self.fast_upscale_lanczos(image_np_uint8)
+            return self.fast_upscale_lanczos(image_np_uint8, scale=4)
+        elif upscaler_model_name == "Fast 2x (Bicubic AA)": 
+            return self.fast_upscale_bicubic(image_np_uint8, scale=2)
+        elif upscaler_model_name == "Fast 2x (Lanczos)":
+            return self.fast_upscale_lanczos(image_np_uint8, scale=2)
         elif self.upscaler_model is None:
             return image_np_uint8
         else:
             return self.run_ai_upscaler(image_np_uint8)
+
 
     def run_ai_upscaler(self, image_np_uint8):
         if self.upscaler_model is None:
@@ -227,6 +202,10 @@ class ForbiddenVisionFaceProcessorIntegrated:
                     upscale_model=self.upscaler_model,
                     image=image_tensor
                 )[0]
+            
+            upscaled_np = upscaled_tensor.squeeze(0).cpu().numpy()
+            upscaled_np_uint8 = (np.clip(upscaled_np, 0, 1) * 255.0).astype(np.uint8)
+            return upscaled_np_uint8
 
         except model_management.InterruptProcessingException:
             raise
@@ -237,10 +216,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error during upscaling process: {e}. Falling back to standard resize.")
             return image_np_uint8
 
-        upscaled_np = upscaled_tensor.squeeze(0).cpu().numpy()
-        upscaled_np_uint8 = (np.clip(upscaled_np, 0, 1) * 255.0).round().astype(np.uint8)
-
-        return upscaled_np_uint8
     def _perform_color_correction_gpu(self, processed_face_tensor, original_crop_tensor, correction_strength):
         try:
             check_for_interruption()
@@ -332,6 +307,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
         except Exception as e:
             print(f"Error creating GPU hybrid blend mask: {e}")
             return (clean_sam_mask_tensor > 0.5).float()
+        
     def combine_all_faces_to_final_image(self, original_image_tensor, all_processed_faces, all_restore_info, blend_softness, enable_color_correction=False, color_correction_strength=1.0):
         try:
             check_for_interruption()
@@ -403,12 +379,11 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
     def process_face_complete(self, model, vae, positive, negative, 
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                        face_selection, processing_resolution, use_adaptive_resolution, enable_pre_upscale, upscaler_model, crop_padding,
+                        face_selection, detection_confidence, manual_rotation, processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
                         face_positive_prompt, replace_positive_prompt, face_negative_prompt, replace_negative_prompt, exclusions,
                         blend_softness, mask_expansion,
                         sampling_mask_blur_size, sampling_mask_blur_strength,
-                        enable_vertical_flip, enable_color_correction,
-                        bbox_model, bbox_model_B, yolo_seg_model, yolo_seg_model_B,
+                        enable_color_correction, enable_segmentation, enable_differential_diffusion,
                         image=None, mask=None, clip=None, latent=None):
         try:
             check_for_interruption()
@@ -429,7 +404,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 return self.create_safe_fallback_outputs(input_image, processing_resolution)
 
             original_image = input_image
-            processing_image = torch.flip(input_image, dims=[1]) if enable_vertical_flip else input_image.clone()
+            processing_image = input_image.clone()
             final_positive_for_face, final_negative_for_face = positive, negative
 
             if clip and (exclusions or face_positive_prompt or face_negative_prompt):
@@ -458,7 +433,10 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
                     pos_tokens = clip.tokenize(final_pos_text)
                     cond, pooled = clip.encode_from_tokens(pos_tokens, return_pooled=True)
-                    final_positive_for_face = [[cond, {"pooled_output": pooled}]]
+                    
+                    new_cond_dict = positive[0][1].copy() if positive and len(positive) > 0 else {}
+                    new_cond_dict["pooled_output"] = pooled
+                    final_positive_for_face = [[cond, new_cond_dict]]
 
                 neg_base_text = extract_original_text(negative)
                 if neg_base_text or face_negative_prompt:
@@ -472,50 +450,91 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
                     neg_tokens = clip.tokenize(final_neg_text)
                     cond, pooled = clip.encode_from_tokens(neg_tokens, return_pooled=True)
-                    final_negative_for_face = [[cond, {"pooled_output": pooled}]]
+                    
+                    new_cond_dict = negative[0][1].copy() if negative and len(negative) > 0 else {}
+                    new_cond_dict["pooled_output"] = pooled
+                    final_negative_for_face = [[cond, new_cond_dict]]
             
             elif not clip and (exclusions or face_positive_prompt or face_negative_prompt):
                 print("[Face Processor] Warning: Face prompts or exclusions were provided, but no CLIP model was connected. These options will be ignored.")
 
             face_masks = []
             if mask is not None:
-                face_masks = [torch.flip(mask, dims=[1]) if enable_vertical_flip else mask]
+                face_masks = [mask]
             else:
                 np_masks = self.face_detector.detect_faces(
                     image_tensor=processing_image, 
-                    bbox_model_name=bbox_model,
-                    bbox_model_B_name=bbox_model_B,
-                    sam_model_name=yolo_seg_model,
-                    sam_model_B_name=yolo_seg_model_B,
-                    detection_confidence=0.5, 
-                    sam_threshold=0.4, 
+                    enable_segmentation=enable_segmentation,
+                    detection_confidence=detection_confidence, 
                     face_selection=face_selection
                 )
                 if np_masks:
                     face_masks = [torch.from_numpy(m).unsqueeze(0) for m in np_masks]
 
             if not face_masks:
-                print("ERROR: No face masks found. Cannot proceed.")
                 return self.create_safe_fallback_outputs(input_image, processing_resolution)
-            
-            self.last_sampling_key = None 
             
             all_processed_faces, all_restore_info = [], []
             
             for i, face_mask in enumerate(face_masks):
                 check_for_interruption()
-                processed_result = self.process_single_face_unified(
-                    processing_image, face_mask, model, vae, final_positive_for_face, final_negative_for_face,
-                    steps, cfg_scale, sampler, scheduler, denoise_strength, seed + i,
-                    processing_resolution, use_adaptive_resolution, enable_pre_upscale, upscaler_model, crop_padding,
-                    mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength
+                
+                target_resolution = (processing_resolution, processing_resolution)
+
+                cropped_face, sampler_mask_batch, restore_info = self.mask_processor.process_and_crop(
+                    image_tensor=processing_image, 
+                    mask_tensor=face_mask, 
+                    crop_padding=crop_padding, 
+                    processing_resolution=target_resolution, 
+                    mask_expansion=mask_expansion,
+                    enable_pre_upscale=enable_pre_upscale,
+                    upscaler_model_name=upscaler_model,
+                    upscaler_loader_callback=self.load_upscaler_model,
+                    upscaler_run_callback=self.run_upscaler
                 )
-                if processed_result:
-                    _, processed_face, restore_info = processed_result
-                    all_processed_faces.append(processed_face)
-                    all_restore_info.append(restore_info)
-                    if len(face_masks) > 1 and i < len(face_masks) - 1 and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                
+                if self.is_empty_detection(cropped_face, restore_info):
+                    continue
+                
+                if manual_rotation != "None":
+                    cropped_face_np = (cropped_face.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                    rotated_face_np = self.apply_manual_rotation(cropped_face_np, manual_rotation)
+                    cropped_face = torch.from_numpy(rotated_face_np.astype(np.float32) / 255.0).unsqueeze(0)
+                    
+                    sampler_mask_np = (sampler_mask_batch.squeeze().cpu().numpy() * 255).astype(np.uint8)
+                    rotated_mask_np = self.apply_manual_rotation(sampler_mask_np, manual_rotation)
+                    sampler_mask_batch = torch.from_numpy(rotated_mask_np.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+                    
+                    restore_info['manual_rotation'] = manual_rotation
+                else:
+                    restore_info['manual_rotation'] = "None"
+                
+                processed_latent = self.run_inpaint_sampling(
+                    cropped_face, sampler_mask_batch, model, vae, final_positive_for_face, final_negative_for_face,
+                    steps, cfg_scale, sampler, scheduler, denoise_strength, seed + i,
+                    sampling_mask_blur_size, sampling_mask_blur_strength,
+                    enable_differential_diffusion
+                )
+                
+                with torch.no_grad():
+                    processed_face_batch = vae.decode(processed_latent["samples"])
+                    if processed_face_batch.min() < -0.5: 
+                        processed_face_batch = (processed_face_batch + 1.0) / 2.0
+                    processed_face_batch = torch.clamp(processed_face_batch, 0.0, 1.0)
+                
+                manual_rot = restore_info.get('manual_rotation', "None")
+
+                if manual_rot != "None":
+                    processed_face_np = (processed_face_batch.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                    restored_face_np = self.reverse_manual_rotation(processed_face_np, manual_rot)
+                    processed_face_batch = torch.from_numpy(restored_face_np.astype(np.float32) / 255.0).unsqueeze(0)
+                    
+                
+                all_processed_faces.append(processed_face_batch)
+                all_restore_info.append(restore_info)
+                
+                if len(face_masks) > 1 and i < len(face_masks) - 1 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if not all_processed_faces:
                 print("ERROR: All face processing failed. Returning original image.")
@@ -529,12 +548,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             processed_face_output = self.create_combined_face_output(all_processed_faces, processing_resolution)
             side_by_side = self.create_unified_comparison(processing_image, all_processed_faces, all_restore_info, processing_resolution)
             final_mask = self.create_unified_mask(all_restore_info, processing_image)
-            
-            if enable_vertical_flip:
-                final_image = torch.flip(final_image, dims=[1])
-                processed_face_output = torch.flip(processed_face_output, dims=[1])
-                side_by_side = torch.flip(side_by_side, dims=[1])
-                final_mask = torch.flip(final_mask, dims=[1])
 
             return (final_image, processed_face_output, side_by_side, final_mask)
             
@@ -542,174 +555,31 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"An error occurred during the main face processing workflow: {e}")
-            (fallback_image, fallback_processed, fallback_comparison, fallback_mask) = self.create_safe_fallback_outputs(input_image, processing_resolution)
-            if enable_vertical_flip and fallback_image is not None:
-                fallback_image = torch.flip(fallback_image, dims=[1])
-                fallback_processed = torch.flip(fallback_processed, dims=[1])
-                fallback_comparison = torch.flip(fallback_comparison, dims=[1])
-                fallback_mask = torch.flip(fallback_mask, dims=[1])
-            return (fallback_image, fallback_processed, fallback_comparison, fallback_mask)
+            return self.create_safe_fallback_outputs(input_image, processing_resolution)
     
-    def _get_adaptive_resolution(self, mask_tensor):
-        try:
-            non_zero_coords = torch.where(mask_tensor > 0.5)
-            if len(non_zero_coords[0]) == 0 or len(non_zero_coords[1]) == 0:
-                return (1024, 1024) 
+    def apply_manual_rotation(self, image_np, rotation_option):
+        if rotation_option == "None":
+            return image_np
+        elif rotation_option == "90° CW":
+            return cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation_option == "90° CCW":
+            return cv2.rotate(image_np, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif rotation_option == "180°":
+            return cv2.rotate(image_np, cv2.ROTATE_180)
+        return image_np
 
-            y_min, y_max = non_zero_coords[1].min(), non_zero_coords[1].max()
-            x_min, x_max = non_zero_coords[2].min(), non_zero_coords[2].max()
-
-            mask_h = y_max - y_min
-            mask_w = x_max - x_min
-            
-            if mask_h == 0 or mask_w == 0:
-                return (1024, 1024)
-
-            aspect_ratio = float(mask_w) / float(mask_h)
-            
-            best_match = (1024, 1024)
-            min_ratio_diff = float('inf')
-
-            for res_w, res_h in self.SDXL_RESOLUTIONS.values():
-                bucket_ratio = float(res_w) / float(res_h)
-                diff = abs(aspect_ratio - bucket_ratio)
-                
-                if diff < min_ratio_diff:
-                    min_ratio_diff = diff
-                    best_match = (res_w, res_h)
-            
-            return best_match
-        except Exception as e:
-            print(f"Warning: Could not determine adaptive resolution due to error: {e}. Falling back to 1024x1024.")
-            return (1024, 1024)
-        
-    def _hash_conditioning(self, conditioning):
-        try:
-            if not conditioning:
-                return 0
-            
-            final_hash = 0
-            for cond_item in conditioning:
-                tensor_hash = 0
-                if len(cond_item) > 0 and torch.is_tensor(cond_item[0]):
-                    tensor = cond_item[0]
-                    sample = tensor.flatten()[::max(1, tensor.numel() // 50)][:100]
-                    tensor_hash = hash(sample.cpu().numpy().round(4).tobytes())
-
-                dict_hash = 0
-                if len(cond_item) > 1 and isinstance(cond_item[1], dict):
-                    for key, value in sorted(cond_item[1].items()):
-                        key_hash = hash(key)
-                        value_hash = 0
-                        if torch.is_tensor(value):
-                            sample = value.flatten()[::max(1, value.numel() // 20)][:50]
-                            value_hash = hash(sample.cpu().numpy().round(4).tobytes())
-                        else:
-                            try:
-                                value_hash = hash(value)
-                            except TypeError:
-                                value_hash = hash(str(value))
-                        
-                        dict_hash = (dict_hash * 31) + hash((key_hash, value_hash))
-
-                item_hash = hash((tensor_hash, dict_hash))
-                final_hash = (final_hash * 31) + item_hash
-                
-            return final_hash
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Warning: Could not fully hash conditioning, caching might be less reliable. Error: {e}")
-            return random.randint(0, 0xffffffffffffffff)
-
-    def get_sampling_cache_key_only(self, image, mask, model, vae, final_positive, final_negative,
-                                steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                                processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
-                                mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength,
-                                enable_vertical_flip, face_selection,
-                                bbox_model, yolo_seg_model, yolo_seg_model_B):
-        try:
-            image_sample = image[0, ::96, ::96, :].flatten()[:50] if image.numel() > 2500 else image.flatten()[:50]
-            image_hash = hash(tuple(image_sample.cpu().numpy().round(3)))
-            
-            mask_hash = 0
-            if mask is not None:
-                mask_sample = mask[0, ::96, ::96].flatten()[:50] if mask.numel() > 2500 else mask.flatten()[:50]
-                mask_hash = hash(tuple(mask_sample.cpu().numpy().round(3)))
-            else:
-                mask_hash = hash((0.5, 0.4, bbox_model, yolo_seg_model, yolo_seg_model_B))
-
-            model_hash = id(model)
-            vae_hash = id(vae)
-            
-            pos_hash = self._hash_conditioning(final_positive)
-            neg_hash = self._hash_conditioning(final_negative)
-            
-            return (
-                image_hash, mask_hash, tuple(image.shape),
-                model_hash, vae_hash, pos_hash, neg_hash,
-                steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
-                mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength,
-                enable_vertical_flip, face_selection
-            )
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error generating sampling cache key: {e}")
-            return None
+    def reverse_manual_rotation(self, image_np, rotation_option):
+        if rotation_option == "None":
+            return image_np
+        elif rotation_option == "90° CW":
+            return cv2.rotate(image_np, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif rotation_option == "90° CCW":
+            return cv2.rotate(image_np, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation_option == "180°":
+            return cv2.rotate(image_np, cv2.ROTATE_180)
+        return image_np
     
-    def process_single_face_unified(self, image, mask, model, vae, final_positive, final_negative,
-                        steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                        processing_resolution, use_adaptive_resolution, enable_pre_upscale, upscaler_model, crop_padding,
-                        mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength):
-        try:
-            if mask is None:
-                return None
-
-            if use_adaptive_resolution:
-                target_resolution = self._get_adaptive_resolution(mask)
-                print(f"[Face Processor] Adaptive resolution: Mask aspect ratio matched to {target_resolution[0]}x{target_resolution[1]}.")
-            else:
-                target_resolution = (processing_resolution, processing_resolution)
-
-            cropped_face, sampler_mask_batch, restore_info = self.mask_processor.process_and_crop(
-                image_tensor=image, 
-                mask_tensor=mask, 
-                crop_padding=crop_padding, 
-                processing_resolution=target_resolution, 
-                mask_expansion=mask_expansion,
-                enable_pre_upscale=enable_pre_upscale,
-                upscaler_model_name=upscaler_model,
-                upscaler_loader_callback=self.load_upscaler_model,
-                upscaler_run_callback=self.run_upscaler
-            )
-            
-            if self.is_empty_detection(cropped_face, restore_info):
-                return None
-            
-            processed_latent = self.run_inpaint_sampling(
-                cropped_face, sampler_mask_batch, model, vae, final_positive, final_negative,
-                steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                sampling_mask_blur_size, sampling_mask_blur_strength
-            )
-            
-            with torch.no_grad():
-                processed_face_batch = vae.decode(processed_latent["samples"])
-                if processed_face_batch.min() < -0.5: 
-                    processed_face_batch = (processed_face_batch + 1.0) / 2.0
-                processed_face_batch = torch.clamp(processed_face_batch, 0.0, 1.0)
-            
-            
-            return (image, processed_face_batch, restore_info)
-            
-        except model_management.InterruptProcessingException:
-            raise
-        except Exception as e:
-            print(f"Error processing single face: {e}")
-            return None
+    
 
     def create_combined_face_output(self, processed_faces, processing_resolution):
         try:
@@ -892,8 +762,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
             fallback_comp = torch.zeros((1, 512, 1024, 3), dtype=torch.float32, device=device)
             return (fallback_img, fallback_img, fallback_comp, fallback_mask)
     
-
-    
     def is_empty_detection(self, cropped_face, restore_info):
         try:
             if isinstance(restore_info, list):
@@ -907,10 +775,16 @@ class ForbiddenVisionFaceProcessorIntegrated:
     
     def run_inpaint_sampling(self, cropped_face, face_mask, model, vae, positive, negative,
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
-                        sampling_mask_blur_size, sampling_mask_blur_strength):
+                        sampling_mask_blur_size, sampling_mask_blur_strength,
+                        enable_differential_diffusion=True):
         try:
+            work_model = model.clone()
+            
+            if enable_differential_diffusion:
+                work_model.set_model_denoise_mask_function(self.differential_diffusion_function)
+
             result = self.process_single_face_sampling(
-                cropped_face, face_mask, model, vae, positive, negative,
+                cropped_face, face_mask, work_model, vae, positive, negative,
                 steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
                 sampling_mask_blur_size, sampling_mask_blur_strength
             )
@@ -929,18 +803,16 @@ class ForbiddenVisionFaceProcessorIntegrated:
             resized_mask_4d = F.interpolate(mask_4d, size=(latent_height, latent_width), mode='bilinear', align_corners=False)
 
             if blur_size > 1 and blur_strength > 0:
-                import math
-                
                 if blur_size % 2 == 0:
                     blur_size += 1
-                
                 base_sigma = (blur_size - 1) / 8.0
-                actual_sigma = base_sigma * (1 + math.tanh(blur_strength - 1) * 2)
-                
+                strength_tensor = torch.tensor(blur_strength - 1.0, device=device, dtype=torch.float32)
+                multiplier = 1.0 + torch.tanh(strength_tensor) * 2.0
+                actual_sigma = base_sigma * multiplier.item()
+
                 blurred_mask_4d = kornia.filters.gaussian_blur2d(
                     resized_mask_4d, (blur_size, blur_size), (actual_sigma, actual_sigma)
                 )
-                
                 return blurred_mask_4d.squeeze(1)
 
             return resized_mask_4d.squeeze(1)
@@ -954,13 +826,12 @@ class ForbiddenVisionFaceProcessorIntegrated:
             else:
                 return torch.zeros((face_mask.shape[0], latent_height, latent_width), device=device)
 
+
     def encode_image_to_latent(self, image, vae):
         try:
             with torch.no_grad():
                 encoded = vae.encode(image)
-            
             return {"samples": encoded}
-            
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
@@ -1024,7 +895,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
                         pass
                 pbar.update_absolute(step + 1, total_steps, preview_bytes)
 
-            
             sampler = comfy.samplers.KSampler(
                 model, steps=steps, device=device, sampler=sampler_name,
                 scheduler=scheduler, denoise=denoise, model_options=model.model_options,
@@ -1076,14 +946,13 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error preparing conditioning: {e}")
             return conditioning
     
-    def fast_upscale_bicubic(self, image_np_uint8):
+    def fast_upscale_bicubic(self, image_np_uint8, scale=4):
         try:
             image_tensor = torch.from_numpy(image_np_uint8.astype(np.float32) / 255.0).unsqueeze(0)
-            
             with torch.no_grad():
                 upscaled_tensor = F.interpolate(
                     image_tensor.permute(0, 3, 1, 2),
-                    scale_factor=4,
+                    scale_factor=scale,
                     mode='bicubic',
                     align_corners=False,
                     antialias=True
@@ -1102,10 +971,10 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error in fast bicubic upscaling: {e}. Returning original image.")
             return image_np_uint8
 
-    def fast_upscale_lanczos(self, image_np_uint8):
+    def fast_upscale_lanczos(self, image_np_uint8, scale=4):
         try:
             h, w = image_np_uint8.shape[:2]
-            new_h, new_w = h * 4, w * 4
+            new_h, new_w = h * scale, w * scale
             
             upscaled_np_uint8 = cv2.resize(
                 image_np_uint8, 

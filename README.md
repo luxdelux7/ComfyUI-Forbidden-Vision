@@ -28,7 +28,7 @@
 
 ## 🚀 Quick Start
 
-1. **Install** via ComfyUI Manager (search "Forbidden Vision") or [manually](#️installation)
+1. **Install** via ComfyUI Manager (search "Forbidden Vision") or [manually](#installation)
 2. **Load the example workflow** from `src/workflows/forbidden_vision_complete.json`
 3. **Enable groups one at a time** using the Fast Group Bypasser:
    - Start with just **Builder** enabled to find your composition

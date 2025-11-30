@@ -534,7 +534,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
             input_image = None
             if latent is not None and "samples" in latent:
-                print("[Face Processor] Latent input detected. Decoding for processing.")
+         
                 with torch.no_grad():
                     input_image = vae.decode(latent["samples"])
                     if input_image.min() < -0.5:

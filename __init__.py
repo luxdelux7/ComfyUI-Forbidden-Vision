@@ -11,10 +11,8 @@ from .src.latent_rebuilder import ForbiddenVisionRebuilder
 from .src.sampler_scheduler_settings import SamplerSchedulerSettings
 from .src.latent_inpaint_lite import ForbiddenVisionInpaintLite
 
-# Ensure directories exist first
 ensure_model_directories()
 
-# Initialize models with detailed status reporting
 def initialize_forbidden_vision():
     try:
         from .src.model_manager import ForbiddenVisionModelManager
@@ -23,7 +21,6 @@ def initialize_forbidden_vision():
         print("=" * 60)
         print("ForbiddenVision: Initializing custom nodes...")
         
-        # Check existing models before attempting downloads
         model_status = check_forbidden_vision_models()
         existing_models = [name for name, exists in model_status.items() if exists]
         
@@ -32,7 +29,6 @@ def initialize_forbidden_vision():
             for model in existing_models:
                 print(f"  ✓ {model}")
         
-        # Initialize model manager and download missing models
         model_manager = ForbiddenVisionModelManager.get_instance()
         validation_status = model_manager.validate_model_availability()
         
@@ -40,18 +36,14 @@ def initialize_forbidden_vision():
             print("ForbiddenVision: No face detection models found, downloading defaults...")
             download_results = model_manager.initialize_default_models()
             
-            # Re-validate after download attempt
             validation_status = model_manager.validate_model_availability()
         
-        # Report final status
         print("\nForbiddenVision: Model Status:")
         print(f"  Face Detection: {'✓' if validation_status['face_detection'] else '✗'}")
         
-        # Removed rotation detection status check here
         
         print(f"  Face Segmentation: {'✓' if validation_status['face_segmentation'] else '✗ (will use oval masks)'}")
         
-        # Provide user guidance based on status
         if validation_status['face_detection']:
             print("ForbiddenVision: Ready to use!")
         else:
@@ -72,7 +64,6 @@ def initialize_forbidden_vision():
         print("ForbiddenVision: Nodes will still load with limited functionality")
         return None
 
-# Run initialization
 FORBIDDEN_VISION_STATUS = initialize_forbidden_vision()
 
 NODE_CLASS_MAPPINGS = {
@@ -97,7 +88,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
 
-# Patch CLIPTextEncode
 try:
     from nodes import CLIPTextEncode
     

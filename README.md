@@ -119,7 +119,7 @@ A first-pass sampler with built-in self-correction for improved initial generati
 
 
 ### Instructions
-
+<a id="installation"></a>
 <details>
 <summary><strong>⚙️ [ Installation ]</strong></summary>
 

@@ -11,15 +11,11 @@
 
 <br>
 
-## 🎯 The Difference
+## ⚡ What Makes It Different
 
-Most face detection fails on **extreme poses, unconventional angles, and NSFW content**. While some mixed-domain models exist, they're usually single-task solutions.
+**Dual custom-trained models** for detection and segmentation—trained on thousands of manually annotated images spanning real photography, anime, and AI-generated content. Handles extreme poses, unconventional angles, and NSFW content that breaks generic tools.
 
-**Forbidden Vision** uses **dual custom-trained models**—separate detection and segmentation trained on thousands of manually annotated images spanning real photography, anime, and AI-generated content. 
-
-✓ Handles extreme poses and partial occlusions  
-✓ Works across any content style  
-✓ Built specifically for diffusion outputsy
+**Complete iterative workflow**—initial composition building, intelligent color/light enhancement, automatic face fixing with context-aware inpainting, and multi-pass refinement for progressive quality improvement.
 
 <br>
 

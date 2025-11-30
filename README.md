@@ -2,7 +2,7 @@
   <img src="./images/header.webp" alt="Forbidden Vision Banner"  style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
   <h1>ComfyUI Forbidden Vision</h1>
   <p>
-    Advanced face restoration, image enhancement, and sampling — built for both realistic and anime AI content, including NSFW.
+    Custom face detection and segmentation for ComfyUI with automatic face fixing, intelligent color grading, and iterative refinement. Works with anime and realistic content, SFW and NSFW.
   </p>
     <a href="https://ko-fi.com/luxdelux" target="_blank">
   <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi">
@@ -13,9 +13,13 @@
 
 ## 🎯 The Difference
 
-Most face tools struggle with AI-generated content because they're trained on limited datasets that don't represent the full spectrum of modern diffusion outputs.
+Most face detection fails on **extreme poses, unconventional angles, and NSFW content**. While some mixed-domain models exist, they're usually single-task solutions.
 
-**Forbidden Vision** uses custom detection and segmentation models trained on a massive hybrid dataset: real photography, anime (Danbooru), and AI-generated content (CivitAI) — both SFW and NSFW. Combined with context-aware inpainting and intelligent enhancement, it handles the reality of modern diffusion workflows where mixed styles are the norm, not the exception.
+**Forbidden Vision** uses **dual custom-trained models**—separate detection and segmentation trained on thousands of manually annotated images spanning real photography, anime, and AI-generated content. 
+
+✓ Handles extreme poses and partial occlusions  
+✓ Works across any content style  
+✓ Built specifically for diffusion outputsy
 
 <br>
 
@@ -25,8 +29,6 @@ Most face tools struggle with AI-generated content because they're trained on li
     <em>From a weak, underlit base, the Refiner corrects tone and exposure, preparing the image for the Fixer to either gently denoise (0.3 here) or drastically reshape the face at 0.8.</em>
   </p>
 </div>
-
-<br>
 
 ## ✨ What's Included
 

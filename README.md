@@ -2,18 +2,20 @@
   <img src="./images/header.webp" alt="Forbidden Vision Banner"  style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
   <h1>ComfyUI Forbidden Vision</h1>
   <p>
-    Face restoration, enhancement, and sampling nodes built for the content you actually generate.
+    Advanced face restoration, image enhancement, and sampling — built for both realistic and anime AI content, including NSFW.
   </p>
-    <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi">
+    <a href="https://ko-fi.com/luxdelux" target="_blank">
+  <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi">
+</a>
 </div>
 
 <br>
 
 ## 🎯 The Difference
 
-Most restoration models are trained on narrow datasets—usually just real faces or just anime—resulting in poor detection on stylized AI content.
+Most face tools struggle with AI-generated content because they're trained on limited datasets that don't represent the full spectrum of modern diffusion outputs.
 
-Forbidden Vision uses **custom detection engines trained on a manually curated dataset** sourced from CivitAI, Danbooru, and real photography (SFW & NSFW). This hybrid training allows the **Fixer** to handle high-denoise generation, drastically altering or replacing faces while maintaining seamless lighting and style consistency with the original image.
+**Forbidden Vision** uses custom detection and segmentation models trained on a massive hybrid dataset: real photography, anime (Danbooru), and AI-generated content (CivitAI) — both SFW and NSFW. Combined with context-aware inpainting and intelligent enhancement, it handles the reality of modern diffusion workflows where mixed styles are the norm, not the exception.
 
 <br>
 

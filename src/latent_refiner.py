@@ -717,11 +717,6 @@ class LatentRefiner:
             contrast_amount = contrast_base * (mC_half + (mC_full - mC_half) * t2)
             shadows_amount  = shadows_base
 
-        print(
-            f"[Auto-Tone Apply] strength={s:.2f} -> "
-            f"Blacks={blacks_amount:.1f}, Shadows={shadows_amount:.1f}, Contrast={contrast_amount:.1f}"
-        )
-
         
         p01 = black_deepening_reqs.get('p01', 0.0)
         p05 = black_deepening_reqs.get('p05', 0.05)
@@ -879,9 +874,6 @@ class LatentRefiner:
 
             recommended_exposure_ev = float(exposure_ev)
 
-
-            print(f"[Auto-Tone Analysis] mean={float(lum_mean):.3f}, std={float(lum_std):.3f}, p01={float(p01):.3f}")
-            print(f"[Auto-Tone Recommended] Blacks={float(recommended_blacks):.1f}, Shadows={float(recommended_shadows):.1f}, Contrast={float(recommended_contrast):.1f}")
 
             return {
                 'recommended_blacks': float(recommended_blacks),

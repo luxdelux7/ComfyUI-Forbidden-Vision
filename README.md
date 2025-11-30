@@ -20,9 +20,9 @@ Forbidden Vision uses **custom detection engines trained on a manually curated d
 <br>
 
 <div align="center">
-  <img src="./images/loop_image.webp" alt="Fixer Loop Example" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
+  <img src="./images/loop_fixer.webp" alt="Fixer Loop Example" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
   <p>
-    <em>From a weak, underlit base, the Refiner corrects tone and exposure, preparing the image for the Fixer to drastically reshape the face at 0.8 denoise.</em>
+    <em>From a weak, underlit base, the Refiner corrects tone and exposure, preparing the image for the Fixer to either gently denoise (0.3 here) or drastically reshape the face at 0.8.</em>
   </p>
 </div>
 

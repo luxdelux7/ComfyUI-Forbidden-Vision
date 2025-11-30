@@ -31,7 +31,6 @@ class ExclusionProcessor:
 
 class ForbiddenVisionFaceProcessorIntegrated:
 
-
     @classmethod
     def INPUT_TYPES(s):
         upscaler_models = get_ordered_upscaler_model_list()
@@ -47,7 +46,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
 
-                "steps": ("INT", {"default": 8, "min": 1, "max": 100}),
+                "steps": ("INT", {"default": 10, "min": 1, "max": 100}),
                 "cfg_scale": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.1}),
                 "sampler": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler_ancestral"}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "sgm_uniform"}),
@@ -55,7 +54,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 
                 "face_selection": ("INT", {"default": 0, "min": 0, "max": 20, "step": 1, "tooltip": "0=All faces, 1=1st face, etc."}),
-                "detection_confidence": ("FLOAT", {"default": 0.75, "min": 0.1, "max": 1.0, "step": 0.1, "tooltip": "Face detection confidence threshold."}),
+                "detection_confidence": ("FLOAT", {"default": 0.75, "min": 0.1, "max": 1.0, "step": 0.01, "tooltip": "Face detection confidence threshold."}),
                 "manual_rotation": (["None", "90° CW", "90° CCW", "180°"], {"default": "None", "tooltip": "Manually rotate face crop before processing"}),
                 "processing_resolution": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64, "tooltip": "The resolution for processing."}),
 
@@ -77,11 +76,11 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 "enable_color_correction": ("BOOLEAN", {"default": True}),
                 "enable_segmentation": ("BOOLEAN", {"default": True, "tooltip": "Use AI segmentation. If disabled, creates oval masks."}),
                 "enable_differential_diffusion": ("BOOLEAN", {"default": True, "tooltip": "Better blending. At high noise, the mask allows structure changes; at low noise, it locks the background."}),
+                "enable_lightness_rescue": ("BOOLEAN", {"default": True, "tooltip": "If the generated face is darker than original, brighten it and run a micro-pass to fix exposure."}),
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "Optional image input. If latent is also provided, latent will be used."}),
                 "latent": ("LATENT", {"tooltip": "Optional latent input. Will be decoded for processing."}),
-                "mask": ("MASK", {"tooltip": "Optional: Face mask for processing. If connected, internal detection is skipped."}),
                 "clip": ("CLIP", {"tooltip": "Optional: Required only if using face prompts."}),                
             }
         }
@@ -100,7 +99,6 @@ class ForbiddenVisionFaceProcessorIntegrated:
         self.upscaler_model_name = None
     
     def differential_diffusion_function(self, sigma, denoise_mask, extra_options):
-    
         try:
             model = extra_options["model"]
             step_sigmas = extra_options["sigmas"]
@@ -216,7 +214,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error during upscaling process: {e}. Falling back to standard resize.")
             return image_np_uint8
 
-    def _perform_color_correction_gpu(self, processed_face_tensor, original_crop_tensor, correction_strength):
+    def _perform_color_correction_gpu(self, processed_face_tensor, original_crop_tensor, correction_strength, rescue_mask=None):
         try:
             check_for_interruption()
             
@@ -239,7 +237,28 @@ class ForbiddenVisionFaceProcessorIntegrated:
             target_mean = torch.mean(target_lab, dim=(2, 3), keepdim=True)
             target_std = torch.std(target_lab, dim=(2, 3), keepdim=True)
             
-            result_lab = (processed_lab - source_mean) * (target_std / (source_std + 1e-6)) + target_mean
+            if rescue_mask is not None:
+                if rescue_mask.dim() == 3:
+                    rescue_mask = rescue_mask.unsqueeze(0)
+                
+                spatial_weight = rescue_mask.permute(0, 3, 1, 2)
+                
+                if spatial_weight.shape[2:] != processed_lab.shape[2:]:
+                    spatial_weight = F.interpolate(spatial_weight, size=processed_lab.shape[2:], mode='bilinear')
+
+                hybrid_target_mean = target_mean.expand_as(processed_lab).clone()
+                
+                target_L = target_mean[:, 0:1, :, :]
+                source_L = source_mean[:, 0:1, :, :]
+                
+                mixed_L = source_L * spatial_weight + target_L * (1.0 - spatial_weight)
+                
+                hybrid_target_mean[:, 0:1, :, :] = mixed_L
+                
+                result_lab = (processed_lab - source_mean) * (target_std / (source_std + 1e-6)) + hybrid_target_mean
+                
+            else:
+                result_lab = (processed_lab - source_mean) * (target_std / (source_std + 1e-6)) + target_mean
             
             corrected_face_permuted = kornia.color.lab_to_rgb(result_lab)
 
@@ -255,6 +274,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
         except Exception as e:
             print(f"Error in GPU color correction: {e}. Returning original processed tensor.")
             return processed_face_tensor
+
 
     def create_compositing_blend_mask_gpu(self, clean_sam_mask_tensor, blend_softness):
         try:
@@ -339,8 +359,16 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
                 if enable_color_correction and color_correction_strength > 0.0:
                     original_crop_tensor = original_image_tensor[:, crop_y1:crop_y2, crop_x1:crop_x2, :]
+                    
+                    rescue_mask = restore_info.get("rescue_mask", None)
+                    if rescue_mask is not None:
+                        rescue_mask = rescue_mask.to(device)
+
                     processed_face_tensor = self._perform_color_correction_gpu(
-                        processed_face_tensor, original_crop_tensor, color_correction_strength
+                        processed_face_tensor, 
+                        original_crop_tensor, 
+                        color_correction_strength,
+                        rescue_mask=rescue_mask
                     )
 
                 resized_processed_face = F.interpolate(
@@ -376,6 +404,122 @@ class ForbiddenVisionFaceProcessorIntegrated:
         except Exception as e:
             print(f"Error combining faces to final image on GPU: {e}")
             return original_image_tensor
+    
+    def check_and_rescue_brightness(self, original_crop, processed_crop, mask, restore_info, model, vae, positive, negative, scheduler, sampler, seed, sampling_mask_blur_size, sampling_mask_blur_strength):
+        try:
+            check_for_interruption()
+            device = original_crop.device
+            
+            if original_crop.ndim == 4: original_crop = original_crop.squeeze(0)
+            if processed_crop.ndim == 4: processed_crop = processed_crop.squeeze(0)
+            if mask.ndim == 4: mask = mask.squeeze(0).squeeze(0)
+            if mask.ndim == 3: mask = mask.squeeze(0)
+            
+            h, w = processed_crop.shape[0], processed_crop.shape[1]
+
+            weights = torch.tensor([0.299, 0.587, 0.114], device=device).view(1, 1, 3)
+            
+            center_h, center_w = int(h * 0.35), int(w * 0.35)
+            h_start, w_start = (h - center_h) // 2, (w - center_w) // 2
+            
+            orig_center = original_crop[h_start:h_start+center_h, w_start:w_start+center_w, :]
+            proc_center = processed_crop[h_start:h_start+center_h, w_start:w_start+center_w, :]
+            
+            orig_luma_center = (orig_center * weights).sum() / (center_h * center_w)
+            proc_luma_center = (proc_center * weights).sum() / (center_h * center_w)
+
+            threshold_ratio = 0.95 
+            
+            if proc_luma_center < orig_luma_center * threshold_ratio:
+                mean_orig_val = orig_luma_center.item()
+                mean_proc_val = proc_luma_center.item()
+                
+                print(f"[Face Processor] Lightness Rescue Triggered: Skin is too dark (Orig: {mean_orig_val:.3f}, Proc: {mean_proc_val:.3f}). Rescuing...")
+                
+                
+                target_map_size = 128
+                mask_4d = mask.unsqueeze(0).unsqueeze(0)
+                small_mask = F.interpolate(mask_4d, size=(target_map_size, target_map_size), mode='bilinear', align_corners=False)
+                
+                kernel_size = int(target_map_size * 0.05) 
+                if kernel_size % 2 == 0: kernel_size += 1
+                if kernel_size < 3: kernel_size = 3
+                eroded_small = -F.max_pool2d(-small_mask, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+                
+                blur_k = kernel_size * 2 + 1
+                sigma = blur_k / 3.0
+                soft_small = kornia.filters.gaussian_blur2d(eroded_small, (blur_k, blur_k), (sigma, sigma))
+                
+                soft_rescue_mask_4d = F.interpolate(soft_small, size=(h, w), mode='bilinear', align_corners=False)
+                spatial_mask = torch.clamp(soft_rescue_mask_4d.squeeze(0).permute(1, 2, 0), 0.0, 1.0)
+                
+                
+                proc_tensor_4d = processed_crop.unsqueeze(0).permute(0, 3, 1, 2)
+                proc_lab = kornia.color.rgb_to_lab(proc_tensor_4d)
+                
+                center_patch_lab = proc_lab[:, 1:, h_start:h_start+center_h, w_start:w_start+center_w]
+                mean_center_ab = center_patch_lab.mean(dim=(2, 3), keepdim=True)
+                
+                diff = proc_lab[:, 1:, :, :] - mean_center_ab
+                dist = torch.norm(diff, dim=1, keepdim=True)
+                
+                sensitivity = 0.05 
+                chroma_mask = torch.exp(-dist * sensitivity)
+                chroma_mask = chroma_mask.squeeze(0).permute(1, 2, 0)
+                
+                final_rescue_mask = spatial_mask * chroma_mask
+                
+                restore_info['rescue_mask'] = final_rescue_mask
+                
+                safe_orig = max(mean_orig_val, 0.01)
+                safe_proc = max(mean_proc_val, 0.01)
+                gamma = float(np.log(safe_orig) / np.log(safe_proc))
+                gamma = max(0.4, min(gamma, 1.0)) 
+                
+                
+                current_luma = (processed_crop * weights).sum(dim=-1, keepdim=True)
+                target_luma = torch.pow(current_luma, gamma)
+                
+                gain_map = target_luma / (current_luma + 1e-6)
+                
+                gamma_corrected_full = processed_crop * gain_map
+                
+                shadow_threshold_low = 0.05
+                shadow_threshold_high = 0.20
+                shadow_anchor = torch.clamp((current_luma - shadow_threshold_low) / (shadow_threshold_high - shadow_threshold_low), 0.0, 1.0)
+                
+                
+                combined_weight = final_rescue_mask * shadow_anchor
+                
+                smart_gamma_face = processed_crop + (gamma_corrected_full - processed_crop) * combined_weight
+                corrected_face = torch.clamp(smart_gamma_face, 0.0, 1.0)
+                
+                corrected_batch = corrected_face.unsqueeze(0)
+                
+                rescue_latent = self.run_inpaint_sampling(
+                    corrected_batch, mask.unsqueeze(0).unsqueeze(0), 
+                    model, vae, positive, negative,
+                    steps=2, cfg_scale=1.0, 
+                    sampler=sampler, scheduler=scheduler,
+                    denoise_strength=0.05, seed=seed + 1,
+                    sampling_mask_blur_size=sampling_mask_blur_size,
+                    sampling_mask_blur_strength=sampling_mask_blur_strength
+                )
+                
+                with torch.no_grad():
+                    rescued_face = vae.decode(rescue_latent["samples"])
+                    if rescued_face.min() < -0.5:
+                        rescued_face = (rescued_face + 1.0) / 2.0
+                    rescued_face = torch.clamp(rescued_face, 0.0, 1.0)
+                
+                return rescued_face
+            
+            return processed_crop.unsqueeze(0)
+            
+        except Exception as e:
+            print(f"[Face Processor] Error in lightness rescue: {e}. Keeping original processed face.")
+            if processed_crop.ndim == 3: return processed_crop.unsqueeze(0)
+            return processed_crop
 
     def process_face_complete(self, model, vae, positive, negative, 
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
@@ -383,8 +527,8 @@ class ForbiddenVisionFaceProcessorIntegrated:
                         face_positive_prompt, replace_positive_prompt, face_negative_prompt, replace_negative_prompt, exclusions,
                         blend_softness, mask_expansion,
                         sampling_mask_blur_size, sampling_mask_blur_strength,
-                        enable_color_correction, enable_segmentation, enable_differential_diffusion,
-                        image=None, mask=None, clip=None, latent=None):
+                        enable_color_correction, enable_segmentation, enable_differential_diffusion, enable_lightness_rescue,
+                        image=None, clip=None, latent=None):
         try:
             check_for_interruption()
 
@@ -459,17 +603,15 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 print("[Face Processor] Warning: Face prompts or exclusions were provided, but no CLIP model was connected. These options will be ignored.")
 
             face_masks = []
-            if mask is not None:
-                face_masks = [mask]
-            else:
-                np_masks = self.face_detector.detect_faces(
-                    image_tensor=processing_image, 
-                    enable_segmentation=enable_segmentation,
-                    detection_confidence=detection_confidence, 
-                    face_selection=face_selection
-                )
-                if np_masks:
-                    face_masks = [torch.from_numpy(m).unsqueeze(0) for m in np_masks]
+            
+            np_masks = self.face_detector.detect_faces(
+                image_tensor=processing_image, 
+                enable_segmentation=enable_segmentation,
+                detection_confidence=detection_confidence, 
+                face_selection=face_selection
+            )
+            if np_masks:
+                face_masks = [torch.from_numpy(m).unsqueeze(0) for m in np_masks]
 
             if not face_masks:
                 return self.create_safe_fallback_outputs(input_image, processing_resolution)
@@ -522,6 +664,15 @@ class ForbiddenVisionFaceProcessorIntegrated:
                         processed_face_batch = (processed_face_batch + 1.0) / 2.0
                     processed_face_batch = torch.clamp(processed_face_batch, 0.0, 1.0)
                 
+                if enable_lightness_rescue:
+                    processed_face_batch = self.check_and_rescue_brightness(
+                        cropped_face, processed_face_batch, sampler_mask_batch,
+                        restore_info,
+                        model, vae, final_positive_for_face, final_negative_for_face,
+                        scheduler, sampler, seed + i, 
+                        sampling_mask_blur_size, sampling_mask_blur_strength
+                    )
+
                 manual_rot = restore_info.get('manual_rotation', "None")
 
                 if manual_rot != "None":

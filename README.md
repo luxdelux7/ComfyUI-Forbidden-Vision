@@ -65,7 +65,8 @@
 
 The Fixer node replaces complex face restoration workflows with a single, reliable node solution. Using 2 custom trained models for detection and mask segmentation you get consistent results with fast performance. Works with both realistic and anime styles for any level of face modification.
 
-> **Note:** While the detection and segmentation models are trained on thousands of images, edge cases and failures can still occur—especially with extreme stylization, heavy occlusion, or unusual compositions. If you encounter a case where detection fails, feel free to share the image (via [GitHub Issues](https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/issues) or [Ko-fi](https://ko-fi.com/luxdelux)) so I can make the models even better
+> **Note:** While the detection and segmentation models are trained on thousands of images, edge cases and failures can still occur—especially with extreme stylization, heavy occlusion, or unusual compositions.
+If you encounter detection failures, report them via [GitHub Issues](ttps://github.com/luxdelux7/ComfyUI-Forbidden-Vision/issues). For NSFW images, upload to an external host (Catbox.moe, ImgBB, etc.) and share the link in your issue.
 
 <div align="center">
 <img src="./images/masks.webp" alt="Mask Example" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">

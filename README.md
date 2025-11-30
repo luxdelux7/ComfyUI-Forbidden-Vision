@@ -26,31 +26,36 @@
   </p>
 </div>
 
+## 🚀 Quick Start
+
+1. **Install** via ComfyUI Manager (search "Forbidden Vision") or [manually](#️-installation)
+2. **Load the example workflow** from `src/workflows/forbidden_vision_complete.json`
+3. **Enable groups one at a time** using the Fast Group Bypasser:
+   - Start with just **Builder** enabled to find your composition
+   - Add **Refiner** to enhance colors and lighting
+   - Enable **Second Pass** for detail refinement
+   - Turn on **Face Fix** if needed
+4. **Adjust and iterate** - tweak settings in each node as you refine
+
+> **Models download automatically** on first run from [HuggingFace](https://huggingface.co/luxdelux7/ForbiddenVision_Models). This may take a minute.
+
 ## ✨ What's Included
 
-<div align="center">
-  <a href="./images/nod.webp" target="_blank">
-    <img src="./images/nod.webp" alt="Suite Overview" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
-  </a>
-</div>
-
-<br>
-
-### The Core Suite
-*   **Fixer** – Face detection, restoration, and context-aware inpainting.
-*   **Refiner** – Automatic enhancement with tone correction, upscaling, and effects.
-*   **Builder** – First-pass sampling with adaptive CFG and self-correction.
+### Core Suite
+* **Fixer** – Face detection, restoration, and context-aware inpainting
+* **Refiner** – Automatic enhancement with tone correction, upscaling, and effects
+* **Builder** – First-pass sampling with adaptive CFG and self-correction
 
 ### Versatile Tools
-*   **Inpainter** – The Fixer’s blending engine in a manual inpainting node.
-*   **Rebuilder** – Basic ksampler with integrated VAE decoding.
-*   **Fixer Mask** – Outputs masks from the detection models.
-*   **Settings** – Simple output for samplers/schedulers.
+* **Inpainter** – The Fixer's blending engine in a manual inpainting node
+* **Rebuilder** – Basic ksampler with integrated VAE decoding
+* **Fixer Mask** – Outputs masks from the detection models
+* **Settings** – Simple output for samplers/schedulers
 
 ## 🎭 Fixer Node
 
 The Fixer node replaces complex face restoration workflows with a single, reliable node solution. Using 2 custom trained models for detection and mask segmentation you get consistent results with fast performance. Works with both realistic and anime styles for any level of face modification.
-> The models are downloaded automatically from their [Hugging Face page](https://huggingface.co/luxdelux7/ForbiddenVision_Models) on first ComfyUI run
+> The models are downloaded automatically from [HuggingFace](https://huggingface.co/luxdelux7/ForbiddenVision_Models) on first ComfyUI run
 
 <div align="center">
 <img src="./images/masks.webp" alt="Mask Example" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">

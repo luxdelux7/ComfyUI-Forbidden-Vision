@@ -28,7 +28,7 @@
 
 ## 🚀 Quick Start
 
-1. **Install** via ComfyUI Manager (search "Forbidden Vision") or [manually](#installation)
+1. **Install** via ComfyUI Manager (search "Forbidden Vision") or [manually](#️-installation)
 2. **Load the example workflow** from `src/workflows/forbidden_vision_complete.json`
 3. **Enable groups one at a time** using the Fast Group Bypasser:
    - Start with just **Builder** enabled to find your composition
@@ -118,44 +118,34 @@ A first-pass sampler with built-in self-correction for improved initial generati
 ---
 
 
-### Instructions
-<a id="installation"></a>
-<details>
-<summary><strong>⚙️ [ Installation ]</strong></summary>
+## ⚙️ Installation
 
 ### Via ComfyUI Manager
 
-1.  Open ComfyUI Manager.
-2.  Click `Install Custom Nodes`.
-3.  Search for `Forbidden Vision` and click **Install**.
-4.  Restart ComfyUI.
+1. Open ComfyUI Manager
+2. Click `Install Custom Nodes`
+3. Search for `Forbidden Vision` and click **Install**
+4. Restart ComfyUI
 
 ### Manual Install
-
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/luxdelux7/ComfyUI-Forbidden-Vision.git
-
-Then navigate to folder
-
 cd ComfyUI-Forbidden-Vision
+
+# For ComfyUI portable:
 ..\..\..\python_embeded\python.exe -m pip install -r requirements.txt
 
-For standard Python installations:
+# For standard Python:
 pip install -r requirements.txt
 ```
 
-
 Then restart ComfyUI.
-</details>
 
 ---
 
 <details>
-<summary><strong>📦 [ Models ]</strong></summary>
-
-
-## Upscaler Models
+<summary><strong>📦 [ Upscale Models ]</strong></summary>
 
 Use any upscale model you prefer, however for both speed and quality I found [Phhofm models](https://github.com/Phhofm/models) to be great, specifically:
 

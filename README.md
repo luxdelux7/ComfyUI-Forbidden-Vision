@@ -4,9 +4,7 @@
   <p>
     Face restoration, enhancement, and sampling nodes built for the content you actually generate.
   </p>
-  <a href="https://ko-fi.com/luxdelux" target="_blank">
     <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi">
-  </a>
 </div>
 
 <br>
@@ -31,8 +29,8 @@ Forbidden Vision uses **custom detection engines trained on a manually curated d
 ## ✨ What's Included
 
 <div align="center">
-  <a href="./images/nodes.webp" target="_blank">
-    <img src="./images/nodes.webp" alt="Suite Overview" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
+  <a href="./images/nod.webp" target="_blank">
+    <img src="./images/nod.webp" alt="Suite Overview" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
   </a>
 </div>
 
@@ -236,16 +234,16 @@ Determines how strongly the blur is applied (default: 1.0). Higher values furthe
 ### Major Toggles
 
 **enable_color_correction**  
-Analyzes the entire image’s tone and lighting, then adjusts the newly sampled face to match it. Prevents mismatched brightness or color shifts.
+Analyzes the entire image’s tone and lighting, then adjusts the newly sampled face to match it. 
+
+**enable_lightness_rescue**  
+Analyzes the face ligthness compared to the original. If its darker by 5% or  more, it brings it closer to the original, then runs a 0.05 denoise sampling pass to cleanup any artifacts. Useful mostly for higher denoise as that can drastically change face brigthness in certain images.
 
 **enable_segmentation**  
 Uses the segmentation model to generate a detailed mask (including eyebrows, eyelashes, facial hair, sunglasses, etc.). When off, falls back to a simple oval mask based on YOLO’s bounding box.
 
 **enable_differential_diffusion**  
 Uses integrated differential diffusion for smoother, more coherent inpainting. Recommended in almost all cases for the most natural results.
-
-
-
 
 
 </details>
@@ -261,17 +259,17 @@ Uses integrated differential diffusion for smoother, more coherent inpainting. R
 Enables optional AI or bicubic upscaling after tone/color/detail processing. Useful before a second sampling pass or as a final enhancement step.
 
 **upscale_model**  
-Select which upscaler to load. Models are auto-detected from your installation. AI upscalers generally produce crisper, more stable images.
+Select which upscaler to load. Models are auto-detected from your ComfyUI upscale_models folder. 
 
 **upscale_factor**  
-Scales the image before optional re-encoding. I personally prefer 1.2 before a second diffusion pass.
+By how much an image should be upscaled. I personally prefer 1.2 before a second diffusion pass.
 
 ---
 
 ### Auto Tone
 
 **enable_auto_tone**  
-Runs an advanced tone analysis (exposure, black depth, shadow balance, contrast, highlight clipping). This produces a Camera-RAW-style correction pass that adapts intelligently to the image’s histogram.
+Adjusts exposure, black levels, shadows, and overall contrast based on the image’s brightness distribution.
 
 **auto_tone_strength**  
 Blends between original and fully auto-toned output.  
@@ -283,38 +281,41 @@ Blends between original and fully auto-toned output.
 ### AI Color Controls
 
 **ai_colors**  
-Enables the vibrance/saturation enhancement module. Unlike simple saturation, vibrance selectively boosts mid-to-low chroma regions while protecting skin tones and sensitive ranges.
+Enables adaptive vibrance. Unlike normal saturation, this boosts dull colors while preventing color clipping.
 
 **ai_colors_strength**  
-Controls vibrance intensity. Internally adapts strength based on luminance and chroma statistics to avoid clipping.
+How intense the vibrance boost should be.
+Higher values = richer color, but still controlled and adaptive.
 
 ---
 
 ### AI Details
+>uses Depth Anything v2 depth estimation model
 
 **ai_details**  
-Enables a depth-aware detail enhancement pipeline. Operates similarly to “clarity”:  
-- Enhances small-scale textures  
-- Suppresses halos  
-- Avoids reintroducing noise  
-- Reduces sharpening in blurred/background regions (via depth map)
+Enables a clarity-style detail boost.
+Sharpens textures while avoiding halos and minimizing noise.
 
 **ai_details_strength**  
-Controls the intensity of texture enhancement. Values above ~1.5 strongly boost micro-textures; lower values are more natural.
+Controls how much detail is added.
 
 ---
 
 ### AI Relighting
+>uses Depth Anything v2 depth estimation model
 
 **ai_relight**  
-Adjusts scene lighting using depth + luminance curves. Brightens subject regions while respecting color stability and avoiding highlight clipping.
+Gently brightens important foreground subjects using depth information.
+Useful for lifting faces, characters, or the main subject without flattening shadows.
 
 **ai_relight_strength**  
-Intensity of relighting effect. Designed to subtly lift faces, characters, and foreground regions without flattening shadows or blowing highlights.
+Controls how bright the relighting effect is.
+Higher = more subject emphasis.
 
 ---
 
 ### AI Depth of Field
+>uses Depth Anything v2 depth estimation model
 
 **ai_enable_dof**  
 Simulates depth of field using an estimated depth map. Foreground and background are blurred based on distance from a computed focus plane.
@@ -360,25 +361,15 @@ Used to re-encode the processed image back into latent form. Required when you w
 <summary><strong>🏗️ [ Builder Settings ]</strong></summary>
 
 
-### Core Sampling
+### Core Sampling and inputs
 
 **self_correction**  
-Performs a low-denoise, 2-step polishing pass at the end of sampling. This corrects small inconsistencies, stabilizes shapes, and reduces overcooked artifacts. Recommended ON for most workflows.
+Performs a 0.05 denoise, 2-step polishing pass at the end of sampling. This corrects small inconsistencies, stabilizes shapes, and reduces overcooked artifacts. Recommended ON for most workflows.
 
-**seed**  
-The base seed for initial noise generation. If self-correction is enabled, the polish pass automatically uses `seed + 1`.
+**vae** *(optional)*  
+If connected, the Builder decodes the final latent to an image preview. If not, output preview is a blank placeholder but the latent remains valid.
 
-**steps**  
-Number of sampling steps. Higher values generally improve quality but increase time. The final polish pass always uses 2 steps regardless of this setting.
-
-**cfg**  
-Classifier-free guidance. Higher values push the image toward the prompt but may introduce artifacts. Defaults to 7 for a strong but stable prompt adherence.
-
-**sampler_name**  
-The sampling algorithm. Defaults to **euler_ancestral**, which pairs well with SDXL and produces stable early-pass structure for character renders.
-
-**scheduler**  
-Controls how noise is scheduled across steps. Default is **sgm_uniform**, a reliable all-rounder for SDXL.
+>The sampling options are the same as the core ksampler. I set **euler_ancestral** with **sgm_uniform** as default as that is usually what I use with most SDXL based models.
 
 ---
 
@@ -393,21 +384,8 @@ Manual width when using “Custom” mode. Must be divisible by 64, since SD lat
 **custom_height**  
 Same as above but for height.
 
-**batch_size**  
-Generates multiple independent images from the same prompt at once. Be mindful of VRAM usage — high resolutions + large batch sizes may exceed GPU memory.
 
----
 
-### Conditioning Inputs
-
-**positive / negative**  
-The conditioning tensors generated by your CLIP-like encoder. Required for the Builder to generate a meaningful latent.
-
-**model**  
-Your diffusion model (SDXL, SD1.5, SD2.1). Determines architecture, sampling behavior, and resolution constraints.
-
-**vae** *(optional)*  
-If connected, the Builder decodes the final latent to an image preview. If not, output preview is a blank placeholder but the latent remains valid.
 
 </details>
 

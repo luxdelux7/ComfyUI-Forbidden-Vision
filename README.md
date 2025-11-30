@@ -65,6 +65,8 @@
 
 The Fixer node replaces complex face restoration workflows with a single, reliable node solution. Using 2 custom trained models for detection and mask segmentation you get consistent results with fast performance. Works with both realistic and anime styles for any level of face modification.
 
+> **Note:** While the detection and segmentation models are trained on thousands of images, edge cases and failures can still occur—especially with extreme stylization, heavy occlusion, or unusual compositions. If you encounter a case where detection fails, feel free to share the image (via [GitHub Issues](https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/issues) or [Ko-fi](https://ko-fi.com/luxdelux)) so I can make the models even better
+
 <div align="center">
 <img src="./images/masks.webp" alt="Mask Example" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
 <p><em>Forbidden Vision segmentation model takes into account face masks, stylistic eyebrows, eyelashes etc. so the inpainting isn't limited</em></p>
@@ -72,9 +74,7 @@ The Fixer node replaces complex face restoration workflows with a single, reliab
 
 **Key Features:**
 
-
-
-* **Face Detection and Masking**: With custom trained Yolo 11 Small detection and EfficientNet-v2 auto masking models
+* **Face Detection and Masking**: Custom trained YOLO11 and segmentation models optimized for mixed-domain content
 * **NSFW friendly**: Works reliably on all adult content without filtering or judgement.
 * **Detail aware segmentation**: Detects eyebrows, eyelashes, sunglasses etc. within the face to ensure best inpainting results
 * **Context-Aware Inpainting**: Crops detected faces, processes them at optimal resolution, and uses conditioned inpainting together with built in differential diffusion to match the original image's lighting and style.

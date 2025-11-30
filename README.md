@@ -39,6 +39,15 @@
 
 > **Models download automatically** on first run from [HuggingFace](https://huggingface.co/luxdelux7/ForbiddenVision_Models). This may take a minute.
 
+<br>
+<div align="center">
+  <img src="./images/proced.webp" alt="Face Processing Example" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
+  <p>
+    <em>Detection, segmentation, and high-denoise inpainting. The mask accurately captures the glasses, allowing complete character transformation if one so chooses.</em>
+  </p>
+</div>
+
+
 ## ✨ What's Included
 
 ### Core Suite
@@ -55,7 +64,6 @@
 ## 🎭 Fixer Node
 
 The Fixer node replaces complex face restoration workflows with a single, reliable node solution. Using 2 custom trained models for detection and mask segmentation you get consistent results with fast performance. Works with both realistic and anime styles for any level of face modification.
-> The models are downloaded automatically from [HuggingFace](https://huggingface.co/luxdelux7/ForbiddenVision_Models) on first ComfyUI run
 
 <div align="center">
 <img src="./images/masks.webp" alt="Mask Example" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">

@@ -1,7 +1,7 @@
 [project]
 name = "forbidden-vision"
 description = "Custom face detection and segmentation for ComfyUI with automatic face fixing, intelligent color grading, and iterative refinement. Custom-trained models optimized for realistic, anime, and NSFW content."
-version = "1.0.0"
+version = "1.0.1"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
@@ -29,7 +29,7 @@ Documentation = "https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/wiki"
 "Bug Tracker" = "https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "luxdelux"
 DisplayName = "ComfyUI-Forbidden-Vision"
 Icon = ""
 includes = [] 

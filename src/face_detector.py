@@ -17,8 +17,8 @@ class ForbiddenVisionFaceDetector:
         self.debug_session_id = None
         self.debug_log_path = None
         self.full_image_for_processing = None
-    
-    
+
+
     def _create_fallback_mask(self, image_tensor, bbox=None):
         """Create a simple fallback mask when detection fails"""
         try:
@@ -47,15 +47,17 @@ class ForbiddenVisionFaceDetector:
         log_entry = f"[{timestamp}] [{level}] {message}\n"
         
         try:
-            with open(self.debug_log_path, 'a') as f:
-                f.write(log_entry)
+            # Only write if log path is set (optional debug feature)
+            if self.debug_log_path:
+                with open(self.debug_log_path, 'a') as f:
+                    f.write(log_entry)
         except:
             pass
         
         if level in ["ERROR", "CRITICAL"]:
-            print(f"DEBUG {level}: {message}")
+            print(f"[ForbiddenVision] DEBUG {level}: {message}")
 
-  
+
 
 
     def detect_faces(self, image_tensor, enable_segmentation=True, detection_confidence=0.6, face_selection=0):
@@ -117,7 +119,7 @@ class ForbiddenVisionFaceDetector:
                         self._debug_log(f"Face {i}: using oval mask fallback")
                     
                     face_masks.append(mask)
-               
+            
             
             if not face_masks:
                 self._debug_log("No faces detected, creating fallback mask", "WARNING")
@@ -144,11 +146,12 @@ class ForbiddenVisionFaceDetector:
                 return [np.zeros((512, 512), dtype=np.float32)]
 
     def _map_crop_mask_to_original(self, crop_mask, crop_coords, original_w, original_h):
-        """Map crop mask back to original image coordinates"""
+        """Map crop mask back to original image coordinates using robust intersection logic"""
         crop_x1, crop_y1, crop_x2, crop_y2 = crop_coords
         crop_w = crop_x2 - crop_x1
         crop_h = crop_y2 - crop_y1
         
+        # Resize mask to the conceptual crop size (which might extend off-screen)
         if crop_mask.shape != (crop_h, crop_w):
             resized_mask = cv2.resize(crop_mask.astype(np.uint8), (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
         else:
@@ -156,17 +159,28 @@ class ForbiddenVisionFaceDetector:
         
         full_mask = np.zeros((original_h, original_w), dtype=np.uint8)
         
-        src_x1 = max(0, -crop_x1)
-        src_y1 = max(0, -crop_y1)
-        src_x2 = src_x1 + min(crop_w, original_w - max(0, crop_x1))
-        src_y2 = src_y1 + min(crop_h, original_h - max(0, crop_y1))
-        
+        # Calculate intersection between the crop rectangle and the image rectangle
+        # Destination indices (clamped to image bounds)
         dst_x1 = max(0, crop_x1)
         dst_y1 = max(0, crop_y1)
-        dst_x2 = dst_x1 + (src_x2 - src_x1)
-        dst_y2 = dst_y1 + (src_y2 - src_y1)
+        dst_x2 = min(original_w, crop_x2)
+        dst_y2 = min(original_h, crop_y2)
         
-        if src_x2 > src_x1 and src_y2 > src_y1:
-            full_mask[dst_y1:dst_y2, dst_x1:dst_x2] = resized_mask[src_y1:src_y2, src_x1:src_x2]
+        # Check if there is a valid intersection
+        if dst_x2 > dst_x1 and dst_y2 > dst_y1:
+            # Source indices (relative to the crop mask)
+            # If crop_x1 is negative (padding on left), src_x1 becomes positive (-crop_x1)
+            # If crop_x1 is positive (inside image), src_x1 is 0 + offset
+            src_x1 = dst_x1 - crop_x1
+            src_y1 = dst_y1 - crop_y1
+            src_x2 = dst_x2 - crop_x1
+            src_y2 = dst_y2 - crop_y1
+            
+            # Perform the copy
+            try:
+                full_mask[dst_y1:dst_y2, dst_x1:dst_x2] = resized_mask[src_y1:src_y2, src_x1:src_x2]
+            except Exception as e:
+                print(f"[ForbiddenVision] Debug: Mask mapping error. Dst: {dst_y2-dst_y1}x{dst_x2-dst_x1}, Src: {src_y2-src_y1}x{src_x2-src_x1}")
+                raise e
         
         return full_mask.astype(np.float32)

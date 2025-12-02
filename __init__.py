@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from .src.utils import ensure_model_directories
 from .src.face_processor_integrated import ForbiddenVisionFaceProcessorIntegrated
 from .src.face_fixer_mask_only import ForbiddenVisionFaceFixerMaskOnly
+from .src.face_edit_nodes import ForbiddenVisionFaceEditPrep, ForbiddenVisionFaceEditMerge
 from .src.latent_refiner import LatentRefiner
 from .src.latent_builder import LatentBuilder
 from .src.latent_rebuilder import ForbiddenVisionRebuilder
@@ -19,7 +20,7 @@ def initialize_forbidden_vision():
         from .src.utils import check_forbidden_vision_models
         
         print("=" * 60)
-        print("ForbiddenVision: Initializing custom nodes...")
+        print("ForbiddenVision: Initializing custom nodes.")
         
         model_status = check_forbidden_vision_models()
         existing_models = [name for name, exists in model_status.items() if exists]
@@ -33,15 +34,12 @@ def initialize_forbidden_vision():
         validation_status = model_manager.validate_model_availability()
         
         if not validation_status['face_detection']:
-            print("ForbiddenVision: No face detection models found, downloading defaults...")
+            print("ForbiddenVision: No face detection models found, downloading defaults.")
             download_results = model_manager.initialize_default_models()
-            
             validation_status = model_manager.validate_model_availability()
         
         print("\nForbiddenVision: Model Status:")
         print(f"  Face Detection: {'✓' if validation_status['face_detection'] else '✗'}")
-        
-        
         print(f"  Face Segmentation: {'✓' if validation_status['face_segmentation'] else '✗ (will use oval masks)'}")
         
         if validation_status['face_detection']:
@@ -69,6 +67,8 @@ FORBIDDEN_VISION_STATUS = initialize_forbidden_vision()
 NODE_CLASS_MAPPINGS = {
     "ForbiddenVisionFaceProcessorIntegrated": ForbiddenVisionFaceProcessorIntegrated,
     "ForbiddenVisionFaceFixerMaskOnly": ForbiddenVisionFaceFixerMaskOnly,
+    "ForbiddenVisionFaceEditPrep": ForbiddenVisionFaceEditPrep,
+    "ForbiddenVisionFaceEditMerge": ForbiddenVisionFaceEditMerge,
     "LatentRefiner": LatentRefiner,
     "LatentBuilder": LatentBuilder,
     "ForbiddenVisionRebuilder": ForbiddenVisionRebuilder,
@@ -79,6 +79,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ForbiddenVisionFaceProcessorIntegrated": "Forbidden Vision 🎯 Fixer",
     "ForbiddenVisionFaceFixerMaskOnly": "Forbidden Vision 🎯 Fixer Mask Only",
+    "ForbiddenVisionFaceEditPrep": "Forbidden Vision 🧩 Face Edit Prep",
+    "ForbiddenVisionFaceEditMerge": "Forbidden Vision 🧩 Face Edit Merge",
     "LatentRefiner": "Forbidden Vision 💎 Refiner",
     "LatentBuilder": "Forbidden Vision 🛠️ Builder",
     "ForbiddenVisionRebuilder": "Forbidden Vision 🔧 Rebuilder",

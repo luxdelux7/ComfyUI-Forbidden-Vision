@@ -76,7 +76,8 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 "enable_color_correction": ("BOOLEAN", {"default": True}),
                 "enable_segmentation": ("BOOLEAN", {"default": True, "tooltip": "Use AI segmentation. If disabled, creates oval masks."}),
                 "enable_differential_diffusion": ("BOOLEAN", {"default": True, "tooltip": "Better blending. At high noise, the mask allows structure changes; at low noise, it locks the background."}),
-                "enable_lightness_rescue": ("BOOLEAN", {"default": True, "tooltip": "If the generated face is darker than original, brighten it and run a micro-pass to fix exposure."}),
+                "enable_lightness_rescue": ("BOOLEAN", {"default": True, "tooltip": "If the generated face is darker than original, brighten it."}),
+                "enable_final_refinement": ("BOOLEAN", {"default": True, "tooltip": "Runs a quick 0.05 denoise pass at the end. Cleans artifacts and improves skin texture with sensitive models and higher denoise. Highly recommended."}),
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "Optional image input. If latent is also provided, latent will be used."}),
@@ -405,7 +406,13 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"Error combining faces to final image on GPU: {e}")
             return original_image_tensor
     
-    def check_and_rescue_brightness(self, original_crop, processed_crop, mask, restore_info, model, vae, positive, negative, scheduler, sampler, seed, sampling_mask_blur_size, sampling_mask_blur_strength):
+    def check_and_perform_lightness_correction(self, original_crop, processed_crop, mask, restore_info):
+        """
+        Checks if the processed face is too dark compared to original.
+        Returns:
+            corrected_face (tensor): The pixel tensor (modified or original).
+            triggered (bool): True if lightness correction was applied.
+        """
         try:
             check_for_interruption()
             device = original_crop.device
@@ -434,9 +441,9 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 mean_orig_val = orig_luma_center.item()
                 mean_proc_val = proc_luma_center.item()
                 
-                print(f"[Face Processor] Lightness Rescue Triggered: Skin is too dark (Orig: {mean_orig_val:.3f}, Proc: {mean_proc_val:.3f}). Rescuing...")
+                print(f"[Face Processor] Lightness Rescue Triggered: Skin is too dark (Orig: {mean_orig_val:.3f}, Proc: {mean_proc_val:.3f}). correcting pixels...")
                 
-                
+                # --- Create Mask ---
                 target_map_size = 128
                 mask_4d = mask.unsqueeze(0).unsqueeze(0)
                 small_mask = F.interpolate(mask_4d, size=(target_map_size, target_map_size), mode='bilinear', align_corners=False)
@@ -453,7 +460,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 soft_rescue_mask_4d = F.interpolate(soft_small, size=(h, w), mode='bilinear', align_corners=False)
                 spatial_mask = torch.clamp(soft_rescue_mask_4d.squeeze(0).permute(1, 2, 0), 0.0, 1.0)
                 
-                
+                # --- Chroma Mask ---
                 proc_tensor_4d = processed_crop.unsqueeze(0).permute(0, 3, 1, 2)
                 proc_lab = kornia.color.rgb_to_lab(proc_tensor_4d)
                 
@@ -469,13 +476,14 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 
                 final_rescue_mask = spatial_mask * chroma_mask
                 
+                # Store for color correction later
                 restore_info['rescue_mask'] = final_rescue_mask
                 
+                # --- Apply Gamma Correction ---
                 safe_orig = max(mean_orig_val, 0.01)
                 safe_proc = max(mean_proc_val, 0.01)
                 gamma = float(np.log(safe_orig) / np.log(safe_proc))
                 gamma = max(0.4, min(gamma, 1.0)) 
-                
                 
                 current_luma = (processed_crop * weights).sum(dim=-1, keepdim=True)
                 target_luma = torch.pow(current_luma, gamma)
@@ -488,38 +496,19 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 shadow_threshold_high = 0.20
                 shadow_anchor = torch.clamp((current_luma - shadow_threshold_low) / (shadow_threshold_high - shadow_threshold_low), 0.0, 1.0)
                 
-                
                 combined_weight = final_rescue_mask * shadow_anchor
                 
                 smart_gamma_face = processed_crop + (gamma_corrected_full - processed_crop) * combined_weight
                 corrected_face = torch.clamp(smart_gamma_face, 0.0, 1.0)
                 
-                corrected_batch = corrected_face.unsqueeze(0)
-                
-                rescue_latent = self.run_inpaint_sampling(
-                    corrected_batch, mask.unsqueeze(0).unsqueeze(0), 
-                    model, vae, positive, negative,
-                    steps=2, cfg_scale=1.0, 
-                    sampler=sampler, scheduler=scheduler,
-                    denoise_strength=0.05, seed=seed + 1,
-                    sampling_mask_blur_size=sampling_mask_blur_size,
-                    sampling_mask_blur_strength=sampling_mask_blur_strength
-                )
-                
-                with torch.no_grad():
-                    rescued_face = vae.decode(rescue_latent["samples"])
-                    if rescued_face.min() < -0.5:
-                        rescued_face = (rescued_face + 1.0) / 2.0
-                    rescued_face = torch.clamp(rescued_face, 0.0, 1.0)
-                
-                return rescued_face
+                return corrected_face.unsqueeze(0), True
             
-            return processed_crop.unsqueeze(0)
+            return processed_crop.unsqueeze(0), False
             
         except Exception as e:
-            print(f"[Face Processor] Error in lightness rescue: {e}. Keeping original processed face.")
-            if processed_crop.ndim == 3: return processed_crop.unsqueeze(0)
-            return processed_crop
+            print(f"[Face Processor] Error in lightness rescue logic: {e}. Keeping original.")
+            if processed_crop.ndim == 3: return processed_crop.unsqueeze(0), False
+            return processed_crop, False
 
     def process_face_complete(self, model, vae, positive, negative, 
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
@@ -527,7 +516,8 @@ class ForbiddenVisionFaceProcessorIntegrated:
                         face_positive_prompt, replace_positive_prompt, face_negative_prompt, replace_negative_prompt, exclusions,
                         blend_softness, mask_expansion,
                         sampling_mask_blur_size, sampling_mask_blur_strength,
-                        enable_color_correction, enable_segmentation, enable_differential_diffusion, enable_lightness_rescue,
+                        enable_color_correction, enable_segmentation, enable_differential_diffusion, 
+                        enable_lightness_rescue, enable_final_refinement,
                         image=None, clip=None, latent=None):
         try:
             check_for_interruption()
@@ -651,6 +641,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 else:
                     restore_info['manual_rotation'] = "None"
                 
+                # --- Main Sampling Pass ---
                 processed_latent = self.run_inpaint_sampling(
                     cropped_face, sampler_mask_batch, model, vae, final_positive_for_face, final_negative_for_face,
                     steps, cfg_scale, sampler, scheduler, denoise_strength, seed + i,
@@ -664,17 +655,36 @@ class ForbiddenVisionFaceProcessorIntegrated:
                         processed_face_batch = (processed_face_batch + 1.0) / 2.0
                     processed_face_batch = torch.clamp(processed_face_batch, 0.0, 1.0)
                 
+                # --- Post Processing & Lightness Rescue ---
+                lightness_triggered = False
                 if enable_lightness_rescue:
-                    processed_face_batch = self.check_and_rescue_brightness(
-                        cropped_face, processed_face_batch, sampler_mask_batch,
-                        restore_info,
-                        model, vae, final_positive_for_face, final_negative_for_face,
-                        scheduler, sampler, seed + i, 
-                        sampling_mask_blur_size, sampling_mask_blur_strength
+                    processed_face_batch, lightness_triggered = self.check_and_perform_lightness_correction(
+                        cropped_face, processed_face_batch, sampler_mask_batch, restore_info
                     )
 
-                manual_rot = restore_info.get('manual_rotation', "None")
+                # --- Final Refinement / Cleanup Pass ---
+                # If we modified the pixels (lightness) OR user enabled refinement, run a quick polish.
+                if enable_final_refinement or lightness_triggered:
+                    refinement_strength = 0.05
+                    # Re-encode pixel result to latent
+                    refinement_latent = self.run_inpaint_sampling(
+                        processed_face_batch, sampler_mask_batch, 
+                        model, vae, final_positive_for_face, final_negative_for_face,
+                        steps=2, cfg_scale=1.0, 
+                        sampler=sampler, scheduler=scheduler,
+                        denoise_strength=refinement_strength, seed=seed + i + 1,
+                        sampling_mask_blur_size=sampling_mask_blur_size,
+                        sampling_mask_blur_strength=sampling_mask_blur_strength
+                    )
+                    
+                    with torch.no_grad():
+                        refined_face = vae.decode(refinement_latent["samples"])
+                        if refined_face.min() < -0.5:
+                            refined_face = (refined_face + 1.0) / 2.0
+                        processed_face_batch = torch.clamp(refined_face, 0.0, 1.0)
 
+                # --- Manual Rotation Reversal ---
+                manual_rot = restore_info.get('manual_rotation', "None")
                 if manual_rot != "None":
                     processed_face_np = (processed_face_batch.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
                     restored_face_np = self.reverse_manual_rotation(processed_face_np, manual_rot)

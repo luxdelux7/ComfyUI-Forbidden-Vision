@@ -47,8 +47,8 @@ class LatentBuilder:
                 "self_correction": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Performs a final low-denoise polishing pass to fix small artifacts."}),
                 
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
-                "cfg": ("FLOAT", {"default": 7.0, "min": 1.0, "max": 30.0, "step": 0.1}),
+                "steps": ("INT", {"default": 15, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {"default": 5.5, "min": 1.0, "max": 30.0, "step": 0.1}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler_ancestral"}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "sgm_uniform"}),
                 
@@ -75,7 +75,11 @@ class LatentBuilder:
         else: 
             width, height = self.RESOLUTIONS[resolution_preset]
 
+        width = (width // 8) * 8
+        height = (height // 8) * 8
+
         device = model_management.get_torch_device()
+        
         latent_tensor = torch.zeros([batch_size, 4, height // 8, width // 8], device=device)
         blank_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32, device=device)
         

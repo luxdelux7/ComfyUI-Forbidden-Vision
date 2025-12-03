@@ -20,6 +20,7 @@ class LatentRefiner:
                 "enable_upscale": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
                 "upscale_model": (upscaler_models, {"default": default_upscaler}),
                 "upscale_factor": ("FLOAT", {"default": 1.2, "min": 1.0, "max": 8.0, "step": 0.05}),
+                "maintain_aspect_ratio": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "If Enabled: Crops edges slightly to fit grid without stretching. If Disabled: Stretches image slightly to fit grid."}),
                 
                 "enable_auto_tone": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),
                 "auto_tone_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -144,12 +145,84 @@ class LatentRefiner:
             print(f"Error loading upscaler model {clean_model_name_val}: {e}")
             self.upscaler_model = None; self.upscaler_model_name = None
             return None
-    
+    def _calculate_best_fit_resolution(self, w_orig, h_orig, scale_factor, alignment=32):
+        """
+        Scans for the Mod-32 resolution closest to the target upscale.
+        Weighted to prioritize minimizing scale error (getting close to requested size)
+        while breaking ties using Aspect Ratio.
+        """
+        target_w = w_orig * scale_factor
+        target_h = h_orig * scale_factor
+        target_area = target_w * target_h
+        original_aspect = w_orig / h_orig
+        
+        best_w, best_h = 0, 0
+        min_error = float('inf')
+        
+        center_w = int(round(target_w / alignment) * alignment)
+        
+        search_range = 2 
+        
+        for i in range(-search_range, search_range + 1):
+            w_candidate = center_w + (i * alignment)
+            if w_candidate <= 0: continue
+            
+            h_ideal = w_candidate / original_aspect
+            h_candidate = int(round(h_ideal / alignment) * alignment)
+            if h_candidate <= 0: continue
+            
+            candidate_area = w_candidate * h_candidate
+            scale_deviation = abs(candidate_area - target_area) / target_area
+            
+            candidate_aspect = w_candidate / h_candidate
+            ar_error = abs(candidate_aspect - original_aspect)
+            
+            total_error = (scale_deviation * 50.0) + (ar_error * 20.0)
+            
+            if total_error < min_error:
+                min_error = total_error
+                best_w = w_candidate
+                best_h = h_candidate
+                
+        return best_h, best_w
+    def _smart_resize_and_crop(self, image_bchw, target_h, target_w):
+        """
+        Resizes image to cover the target dimensions while maintaining aspect ratio,
+        then center crops to fit exactly. 
+        """
+        B, C, H, W = image_bchw.shape
+        
+        target_ratio = target_w / target_h
+        current_ratio = W / H
+        
+        if current_ratio > target_ratio:
+            scale_factor = target_h / H
+            temp_h = target_h
+            temp_w = int(W * scale_factor)
+        else:
+            scale_factor = target_w / W
+            temp_w = target_w
+            temp_h = int(H * scale_factor)
+            
+        resized = F.interpolate(image_bchw, size=(temp_h, temp_w), mode='bicubic', align_corners=False, antialias=True)
+        
+        if temp_w == target_w and temp_h == target_h:
+            return resized
+            
+        start_x = (temp_w - target_w) // 2
+        start_y = (temp_h - target_h) // 2
+        
+        start_x = max(0, start_x)
+        start_y = max(0, start_y)
+        
+        cropped = resized[:, :, start_y:start_y+target_h, start_x:start_x+target_w]
+        return cropped
     
     def refine_and_process(self,
                         enable_auto_tone,
                         auto_tone_strength,
                         enable_upscale, upscale_model, upscale_factor,
+                        maintain_aspect_ratio,
                         ai_colors, ai_colors_strength,
                         ai_details, ai_details_strength,
                         ai_relight, ai_relight_strength,
@@ -191,7 +264,6 @@ class LatentRefiner:
                     self.cached_decoded_image = decoded_image
                     self.cached_vae_hash = current_vae_hash
                     self.cached_input_hash = current_input_hash
-
 
             if decoded_image is None:
                 dummy_latent = latent if is_latent_input else {"samples": torch.zeros((1, 4, 64, 64))}
@@ -236,18 +308,38 @@ class LatentRefiner:
             corrected_bchw = self.apply_final_clipping_protection(final_bchw)
             final_image = corrected_bchw.permute(0, 2, 3, 1)
 
+            ALIGNMENT = 32
+            
+            h_orig, w_orig = final_image.shape[1], final_image.shape[2]
+            
             if enable_upscale and upscale_factor > 1.0:
-                h_orig, w_orig = final_image.shape[1], final_image.shape[2]
-                target_h, target_w = int(h_orig * upscale_factor), int(w_orig * upscale_factor)
+                target_h, target_w = self._calculate_best_fit_resolution(w_orig, h_orig, upscale_factor, ALIGNMENT)
+                
                 if upscale_model == "Simple: Bicubic (Standard)":
-                    final_image = F.interpolate(final_image.movedim(-1, 1), size=(target_h, target_w), mode='bicubic', align_corners=False, antialias=True).movedim(1, -1)
+                    upscaled_temp = F.interpolate(final_image.movedim(-1, 1), scale_factor=upscale_factor, mode='bicubic', align_corners=False, antialias=True)
                 else:
                     loaded_model = self.load_upscaler_model(upscale_model)
                     if loaded_model:
                         ai_upscaled_image = nodes.NODE_CLASS_MAPPINGS['ImageUpscaleWithModel']().upscale(upscale_model=loaded_model, image=final_image)[0]
-                        final_image = F.interpolate(ai_upscaled_image.movedim(-1, 1), size=(target_h, target_w), mode='bicubic', align_corners=False, antialias=True).movedim(1, -1)
+                        upscaled_temp = ai_upscaled_image.movedim(-1, 1)
                     else:
-                        print(f"Warning: Upscaler model {upscale_model} failed to load. Skipping upscale.")
+                        print(f"Warning: Upscaler model {upscale_model} failed to load. Fallback to bicubic.")
+                        upscaled_temp = F.interpolate(final_image.movedim(-1, 1), scale_factor=upscale_factor, mode='bicubic', align_corners=False, antialias=True)
+
+                if maintain_aspect_ratio:
+                    final_image = self._smart_resize_and_crop(upscaled_temp, target_h, target_w).movedim(1, -1)
+                else:
+                    final_image = F.interpolate(upscaled_temp, size=(target_h, target_w), mode='bicubic', align_corners=False, antialias=True).movedim(1, -1)
+                
+            else:
+                if h_orig % ALIGNMENT != 0 or w_orig % ALIGNMENT != 0:
+                    target_h, target_w = self._calculate_best_fit_resolution(w_orig, h_orig, 1.0, ALIGNMENT)
+                    
+                    if maintain_aspect_ratio:
+                        final_image = self._smart_resize_and_crop(final_image.movedim(-1, 1), target_h, target_w).movedim(1, -1)
+                    else:
+                        final_image = F.interpolate(final_image.movedim(-1, 1), size=(target_h, target_w), mode='bicubic', align_corners=False, antialias=True).movedim(1, -1)
+
 
             final_image = final_image.to(device)
             

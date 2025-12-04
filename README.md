@@ -109,9 +109,9 @@ The Refiner node handles automatic image enhancement that would normally require
 * **Depth of Field Effects**: Simulates depth of field using depth maps
 * **Dual Input/Output Support**: Works with both latents and images, fitting anywhere in your workflow.
 
-### 🏗️ Builder Node
+### 🏗️ Builder and Rebuilder Node
 
-A first-pass sampler with built-in self-correction for improved initial generations.
+First-pass and second-pass sampling nodes with integraded useful features to reduce clutter.
 
 <div align="center">
 <img src="./images/sfc.webp" alt="Builder Example" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
@@ -121,6 +121,7 @@ A first-pass sampler with built-in self-correction for improved initial generati
 **Key Features:**
 
 * **Self-Correction**: A final 2 step polish pass that automatically refines the generated image with minimal denoising of 0.05 for cleaner results.
+* **Restart Sampling**: Rebuilder offers preset driven restart sampling which can increase details
 * **Resolution Presets**: Built-in SDXL, SD1.5 and other optimal resolution presets, plus custom sizing.
 * **Integrated VAE Decoding**: Automatically outputs both latent and decoded image when VAE is connected.
 
@@ -393,11 +394,24 @@ Same as above but for height.
 
 </details>
 
+---
 
+## 📚 How to Cite Forbidden Vision
+
+If you use **ComfyUI Forbidden Vision** in your research, publications, or open-source work, you can cite it as:
+
+    @misc{forbiddenvision2025,
+      author       = {Luxdelux},
+      title        = {Forbidden Vision: Advanced Face Detection, Segmentation, and Refinement for ComfyUI},
+      year         = {2025},
+      publisher    = {GitHub},
+      journal      = {GitHub Repository},
+      howpublished = {\url{https://github.com/luxdelux7/ComfyUI-Forbidden-Vision}}
+    }
 
 ---
 
 
 ## ⚖️ License
 
-This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the **GNU Affero General Public License v3.0**. See the [LICENSE](LICENSE) file for details.

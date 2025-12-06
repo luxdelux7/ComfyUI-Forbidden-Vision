@@ -53,6 +53,7 @@ class ForbiddenVisionInpaintLite:
                 "blend_softness": ("INT", {"default": 12, "min": 0, "max": 200, "step": 1}),
                 "enable_color_correction": ("BOOLEAN", {"default": True}),
                 "enable_differential_diffusion": ("BOOLEAN", {"default": True}),
+                "bypass_cropping": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Skip cropping and perform full-image inpainting"}),
             }
         }
 
@@ -410,10 +411,59 @@ class ForbiddenVisionInpaintLite:
     def process_inpaint(self, model, vae, positive, negative, image, mask, steps, cfg, sampler, scheduler, 
                        denoise, seed, processing_resolution, manual_rotation, enable_pre_upscale, upscaler_model,
                        mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, blend_softness,
-                       enable_color_correction, enable_differential_diffusion, crop_padding):
+                       enable_color_correction, enable_differential_diffusion, crop_padding, bypass_cropping):
         try:
             check_for_interruption()
             device = model_management.get_torch_device()
+            
+            if bypass_cropping:
+                image_tensor = image.to(device)
+                mask_tensor = mask.to(device)
+                
+                if len(mask_tensor.shape) == 2:
+                    mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+                elif len(mask_tensor.shape) == 3:
+                    mask_tensor = mask_tensor.unsqueeze(1)
+                
+                VAEEncodeClass = nodes.NODE_CLASS_MAPPINGS['VAEEncode']
+                vae_encoder = VAEEncodeClass()
+                latent = vae_encoder.encode(vae, image_tensor)[0]
+                
+                latent_h, latent_w = latent["samples"].shape[2], latent["samples"].shape[3]
+                sampling_mask_latent = F.interpolate(mask_tensor, size=(latent_h, latent_w), mode='bilinear', align_corners=False)
+                
+                if sampling_mask_blur_size > 1 and sampling_mask_blur_strength > 0:
+                    ksize = sampling_mask_blur_size if sampling_mask_blur_size % 2 == 1 else sampling_mask_blur_size + 1
+                    base_sigma = (ksize - 1) / 8.0
+                    strength_tensor = torch.tensor(sampling_mask_blur_strength - 1.0, device=device, dtype=torch.float32)
+                    multiplier = 1.0 + torch.tanh(strength_tensor) * 2.0
+                    actual_sigma = base_sigma * multiplier.item()
+                    
+                    sampling_mask_latent = kornia.filters.gaussian_blur2d(
+                        sampling_mask_latent, (ksize, ksize), (actual_sigma, actual_sigma)
+                    )
+                
+                if enable_differential_diffusion:
+                    model_clone = model.clone()
+                    model_clone.set_model_denoise_mask_function(self.differential_diffusion_function)
+                else:
+                    model_clone = model
+                
+                sampled_latent = self.run_ksampler(
+                    model_clone, positive, negative, latent,
+                    steps, cfg, sampler, scheduler, denoise, seed,
+                    denoise_mask=sampling_mask_latent
+                )
+                
+                VAEDecodeClass = nodes.NODE_CLASS_MAPPINGS['VAEDecode']
+                vae_decoder = VAEDecodeClass()
+                result_tensor = vae_decoder.decode(vae, sampled_latent)[0]
+                
+                if result_tensor.min() < -0.5:
+                    result_tensor = (result_tensor + 1.0) / 2.0
+                result_tensor = torch.clamp(result_tensor, 0.0, 1.0)
+                
+                return (result_tensor, sampled_latent)
             
             cropped_face_tensor, sampler_mask_tensor, restore_info = self.mask_processor.process_and_crop(
                 image_tensor=image,

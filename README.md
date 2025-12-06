@@ -121,7 +121,7 @@ First-pass and second-pass sampling nodes with integraded useful features to red
 **Key Features:**
 
 * **Self-Correction**: A final 2 step polish pass that automatically refines the generated image with minimal denoising of 0.05 for cleaner results.
-* **Restart Sampling**: Rebuilder offers preset driven restart sampling which can increase details
+* **Restart Sampling**: Rebuilder offers experimental preset driven restart sampling which can increase details
 * **Resolution Presets**: Built-in SDXL, SD1.5 and other optimal resolution presets, plus custom sizing.
 * **Integrated VAE Decoding**: Automatically outputs both latent and decoded image when VAE is connected.
 

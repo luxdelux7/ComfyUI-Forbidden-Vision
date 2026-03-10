@@ -24,7 +24,7 @@ trained from scratch on hand-curated data, built specifically for these tasks:
 <br>
 
 <div align="center">
-  <img src="./images/anima.webp" alt="Fixer Loop Example" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
+  <img src="./images/all_loop.webp" alt="Fixer Loop Example" width="100%" style="border-radius: 6px; box-shadow: 0 0 12px rgba(0,0,0,0.1);">
   <p>
     <em>The Refiner corrects tone and colors, preparing the image for the Fixer to either gently denoise (0.3 here) or drastically reshape the face at 0.8.</em>
   </p>

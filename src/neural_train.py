@@ -12,7 +12,6 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 import kornia
-from colorama import Fore, Style
 
 warnings.filterwarnings("ignore")
 torch.set_float32_matmul_precision("high")
@@ -2238,7 +2237,7 @@ def bucket_collate(batch):
 def diagnose_controls(model, device, epoch):
     diag_path = Path(r"G:\Data\color\tests\035_hdlp_015_ORIGINAL.png")
     if not diag_path.exists():
-        print(f"{Fore.YELLOW}🔬 DIAG Ep {epoch}: file not found, skipping{Style.RESET_ALL}")
+        
         return
     model.eval()
     tf  = T.ToTensor()
@@ -2265,7 +2264,7 @@ def diagnose_controls(model, device, epoch):
     cg_abs = cg.abs().mean().item()
     cg_max = cg.abs().max().item()
    
-    print(f"{Fore.YELLOW}🔬 DIAG Ep {epoch}:{Style.RESET_ALL}")
+
     temp = aux["temp"].item()
     tint = aux["tint"].item()
     base_mired = 1e6 / 6500.0
@@ -2307,7 +2306,7 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     out_root = CONF["paths"]["out"];  out_root.mkdir(parents=True, exist_ok=True)
-    print(f"{Fore.CYAN}=== Combined YUV+WB Training ==={Style.RESET_ALL}")
+   
 
     NUM_WORKERS = 4
     train_ds = GlobalBucketDataset(CONF["paths"]["processed_train"], aug=True)
@@ -2402,13 +2401,7 @@ def main():
         score = (avg_rgb + 0.30*avg_ssim + 0.35*avg_luma +
                  0.25*avg_uv + 0.20*avg_detail + 0.15*avg_uven)
 
-        print(f"📊 VAL Ep {ep}: {score:.5f} | "
-              f"RGB {Fore.YELLOW}{avg_rgb:.5f}{Style.RESET_ALL} | "
-              f"SSIM {Fore.MAGENTA}{avg_ssim:.5f}{Style.RESET_ALL} | "
-              f"Luma {Fore.CYAN}{avg_luma:.5f}{Style.RESET_ALL} | "
-              f"UV {Fore.GREEN}{avg_uv:.5f}{Style.RESET_ALL} | "
-              f"Det {Fore.CYAN}{avg_detail:.5f}{Style.RESET_ALL} | "
-              f"UVen {Fore.GREEN}{avg_uven:.5f}{Style.RESET_ALL}")
+        
 
         if ep >= CONF["min_epoch_to_save"]:
             if score < best_score - 1e-4:
@@ -2422,11 +2415,11 @@ def main():
                         f.write(f"    {repr(k)}: {v},\n")
                     f.write("}\n")
                 run_inference_on_folder(model, save_dir)
-                print(f"{Fore.GREEN}⭐ Saved: {save_dir.name}{Style.RESET_ALL}")
+               
             else:
                 bad_epochs += 1
                 if bad_epochs >= CONF["patience"]:
-                    print(f"{Fore.RED}🛑 Early stop{Style.RESET_ALL}")
+                   
                     break
 
 if __name__ == "__main__":

@@ -69,9 +69,10 @@ def check_forbidden_vision_models():
     
     model_status = {}
     required_files = [
-        "ForbiddenVision_face_detect_v1.pt", 
-        "ForbiddenVision_face_segment_v1.pth",
-        "ForbiddenVision_neural_corrector_v1.pth"
+        "ForbiddenVision_face_detect_v1.pt",
+        "ForbiddenVision_face_detect_v1.onnx",
+        "ForbiddenVision_face_segment_v1.safetensors",
+        "ForbiddenVision_neural_corrector_v1.safetensors"
     ]
     
     for filename in required_files:

@@ -80,6 +80,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 "enable_differential_diffusion": ("BOOLEAN", {"default": True, "tooltip": "Better blending. At high noise, the mask allows structure changes; at low noise, it locks the background."}),
                 "enable_lightness_rescue": ("BOOLEAN", {"default": True, "tooltip": "If the generated face is darker than original, brighten it."}),
                 "enable_final_refinement": ("BOOLEAN", {"default": True, "tooltip": "Runs a quick 0.05 denoise pass at the end. Cleans artifacts and improves skin texture with sensitive models and higher denoise. Highly recommended."}),
+                "offload_models_to_cpu": ("BOOLEAN", {"default": True, "tooltip": "Move face detection/segmentation/corrector models from VRAM to RAM after processing. Frees GPU memory for other nodes (e.g. checkpoint swaps in queued workflows). Disable if you're chaining many face passes and want to skip the small reload overhead."}),
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "Optional image input. If latent is also provided, latent will be used."}),
@@ -556,6 +557,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
                         sampling_mask_blur_size, sampling_mask_blur_strength,
                         enable_color_correction, enable_segmentation, enable_differential_diffusion, 
                         enable_lightness_rescue, enable_final_refinement,
+                        offload_models_to_cpu=True,
                         image=None, clip=None, latent=None):
         try:
             check_for_interruption()
@@ -825,6 +827,12 @@ class ForbiddenVisionFaceProcessorIntegrated:
         except Exception as e:
             print(f"An error occurred during the main face processing workflow: {e}")
             return self.create_safe_fallback_outputs(input_image, processing_resolution)
+        finally:
+            if offload_models_to_cpu:
+                try:
+                    self.face_detector.model_manager.offload_to_cpu()
+                except Exception as e:
+                    print(f"ForbiddenVision: Offload failed (non-fatal): {e}")
     
     def apply_manual_rotation(self, image_np, rotation_option):
         if rotation_option == "None":

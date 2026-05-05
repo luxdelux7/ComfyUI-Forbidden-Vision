@@ -183,11 +183,24 @@ class ForbiddenVisionModelManager:
         model_name_pt   = 'ForbiddenVision_face_detect_v1.pt'
         model_name_onnx = 'ForbiddenVision_face_detect_v1.onnx'
 
+        device = model_management.get_torch_device()
+
         for name in (model_name_onnx, model_name_pt):
             if name in self._models:
-                return self._models[name]
+                cached = self._models[name]
+                # Skip device transfer for ONNX — onnxruntime handles its own placement
+                if name.endswith('.onnx'):
+                    return cached
+                # Move PyTorch model back to GPU if it was offloaded
+                target = cached.model if hasattr(cached, 'model') and hasattr(cached.model, 'to') else cached
+                try:
+                    params = list(target.parameters()) if hasattr(target, 'parameters') else []
+                    if params and params[0].device != device:
+                        target.to(device)
+                except Exception:
+                    pass
+                return cached
 
-        device = model_management.get_torch_device()
         onnx_available = self._check_onnx_available()
         is_cuda = device.type == "cuda"
 
@@ -252,6 +265,13 @@ class ForbiddenVisionModelManager:
     def load_segmentation_model(self):
         check_for_interruption()
         if self.segmentation_model is not None:
+            device = model_management.get_torch_device()
+            try:
+                params = list(self.segmentation_model.parameters())
+                if params and params[0].device != device:
+                    self.segmentation_model.to(device)
+            except Exception:
+                pass
             return self.segmentation_model
 
         try:
@@ -296,7 +316,15 @@ class ForbiddenVisionModelManager:
     def load_neural_corrector(self):
         check_for_interruption()
         if 'neural_corrector' in self._models:
-            return self._models['neural_corrector']
+            cached = self._models['neural_corrector']
+            device = model_management.get_torch_device()
+            try:
+                params = list(cached.parameters())
+                if params and params[0].device != device:
+                    cached.to(device)
+            except Exception:
+                pass
+            return cached
 
         if not TIMM_AVAILABLE:
             print("ForbiddenVision: timm not installed, neural corrector unavailable")
@@ -517,6 +545,38 @@ class ForbiddenVisionModelManager:
         self._models.clear()
         self.segmentation_model = None
         print("Cleared ForbiddenVision model cache")
+
+    def offload_to_cpu(self):
+        """Move all loaded models from VRAM to system RAM to free GPU memory.
+        Models stay in self._models / self.segmentation_model and will be
+        moved back to GPU on next use.
+        
+        Note: ONNX models are skipped — they're managed by onnxruntime, not
+        PyTorch, and their device is fixed at session creation."""
+        try:
+            for key, m in self._models.items():
+                # Skip ONNX YOLO models — onnxruntime manages its own memory
+                if key.endswith('.onnx'):
+                    continue
+                
+                # YOLO wraps the actual nn.Module in .model
+                target = m.model if hasattr(m, 'model') and hasattr(m.model, 'to') else m
+                if hasattr(target, 'to'):
+                    try:
+                        target.to('cpu')
+                    except Exception as e:
+                        print(f"ForbiddenVision: Could not offload {key}: {e}")
+
+            if self.segmentation_model is not None:
+                try:
+                    self.segmentation_model.to('cpu')
+                except Exception as e:
+                    print(f"ForbiddenVision: Could not offload segmentation model: {e}")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"ForbiddenVision: Error during CPU offload: {e}")
 
 
 @torch.no_grad()

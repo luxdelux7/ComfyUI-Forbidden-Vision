@@ -184,7 +184,16 @@ class DepthAnythingManager:
         check_for_interruption()
         
         if model_name in self._model_cache and model_name in self._transform_cache:
-            return self._model_cache[model_name], self._transform_cache[model_name]
+            cached_model = self._model_cache[model_name]
+            device = model_management.get_torch_device()
+            # Move back to GPU if it was offloaded
+            try:
+                params = list(cached_model.parameters())
+                if params and params[0].device != device:
+                    cached_model.to(device)
+            except Exception:
+                pass
+            return cached_model, self._transform_cache[model_name]
         
         MODEL_CONFIGS = {
             "V2-Small": {
@@ -351,7 +360,19 @@ class DepthAnythingManager:
         except Exception as e:
             print(f"Depth Manager: Error in full image inference: {e}")
             return None
-
+    def offload_to_cpu(self):
+        """Move all cached depth models from VRAM to system RAM to free GPU memory.
+        Models stay in self._model_cache and will be moved back to GPU on next use."""
+        try:
+            for name, model in self._model_cache.items():
+                try:
+                    model.to('cpu')
+                except Exception as e:
+                    print(f"Depth Manager: Could not offload {name}: {e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"Depth Manager: Error during CPU offload: {e}")
     def clear_cache(self):
         self._model_cache.clear()
         self._transform_cache.clear()

@@ -35,9 +35,11 @@ class LatentRefiner:
                 
                 "maintain_aspect_ratio": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "If Enabled: Crops edges slightly to fit grid without stretching."}),
                 "enforce_mod32_boundaries": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Forces output resolution to be a multiple of 32."}),
+
                 
                 "use_tiled_vae": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
                 "tile_size": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64}),
+                "offload_models_to_cpu": ("BOOLEAN", {"default": True, "tooltip": "Move neural corrector and depth models from VRAM to RAM after processing. Frees GPU memory for other nodes (e.g. checkpoint swaps in queued workflows). Disable if you're chaining many refiner passes and want to skip the small reload overhead."}),
             },
             "optional": {
                 "latent": ("LATENT",),
@@ -213,6 +215,7 @@ class LatentRefiner:
                         depth_dof_model,
                         maintain_aspect_ratio, enforce_mod32_boundaries,
                         use_tiled_vae, tile_size,
+                        offload_models_to_cpu=True,
                         latent=None, vae=None, image=None, **kwargs):
         try:
             check_for_interruption()
@@ -233,6 +236,7 @@ class LatentRefiner:
             maintain_aspect_ratio = bool(maintain_aspect_ratio)
             enforce_mod32_boundaries = bool(enforce_mod32_boundaries)
             use_tiled_vae = bool(use_tiled_vae)
+            offload_models_to_cpu = bool(offload_models_to_cpu)
             # --- End sanitization ---
             device = model_management.get_torch_device()
 
@@ -412,6 +416,21 @@ class LatentRefiner:
             dummy_latent = latent if latent is not None else {"samples": torch.zeros((1, 4, 64, 64))}
             dummy_image = image if image is not None else torch.zeros((1, 64, 64, 3))
             return (dummy_latent, dummy_image)
+        finally:
+            if offload_models_to_cpu:
+                # Offload neural corrector via the shared model manager
+                try:
+                    from .model_manager import ForbiddenVisionModelManager
+                    ForbiddenVisionModelManager.get_instance().offload_to_cpu()
+                except Exception as e:
+                    print(f"[LatentRefiner] Neural corrector offload failed (non-fatal): {e}")
+
+                # Offload depth model if its manager supports it
+                try:
+                    if hasattr(self.depth_manager, 'offload_to_cpu'):
+                        self.depth_manager.offload_to_cpu()
+                except Exception as e:
+                    print(f"[LatentRefiner] Depth model offload failed (non-fatal): {e}")
 
     def detect_clipping_issues(self, rgb_bchw):
         luma = 0.2126 * rgb_bchw[:, 0:1] + 0.7152 * rgb_bchw[:, 1:2] + 0.0722 * rgb_bchw[:, 2:3]

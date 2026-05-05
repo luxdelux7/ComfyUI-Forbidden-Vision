@@ -212,11 +212,14 @@ class ForbiddenVisionModelManager:
                 if is_cuda and "CUDAExecutionProvider" in providers:
                     use_onnx = True
                     print("ForbiddenVision: ONNX runtime with CUDA support detected")
+                elif is_cuda and "ROCMExecutionProvider" in providers:
+                    use_onnx = True
+                    print("ForbiddenVision: ONNX runtime with ROCm support detected")
                 elif not is_cuda:
                     use_onnx = True
                     print("ForbiddenVision: ONNX runtime (CPU) detected")
                 else:
-                    print("ForbiddenVision: onnxruntime installed but no CUDA provider, falling back to .pt")
+                    print("ForbiddenVision: onnxruntime installed but no GPU provider, falling back to .pt")
             except Exception:
                 pass
 

@@ -11,7 +11,7 @@ import latent_preview
 import cv2
 import kornia
 from .mask_processor import ForbiddenVisionMaskProcessor
-from .utils import check_for_interruption, get_ordered_upscaler_model_list, ensure_model_directories, clean_model_name
+from .utils import check_for_interruption, get_ordered_upscaler_model_list, ensure_model_directories, clean_model_name, normalize_vae_decode_output
 
 class ForbiddenVisionInpaintLite:
 
@@ -54,6 +54,7 @@ class ForbiddenVisionInpaintLite:
                 "enable_color_correction": ("BOOLEAN", {"default": True}),
                 "enable_differential_diffusion": ("BOOLEAN", {"default": True}),
                 "bypass_cropping": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled", "tooltip": "Skip cropping and perform full-image inpainting"}),
+                "bypass_latent_output": ("BOOLEAN", {"default": True, "label_on": "Bypassed", "label_off": "Enabled", "tooltip": "Skip encoding the final image to latent. The LATENT output returns an empty placeholder. Turn off only if you need the latent downstream."}),
             }
         }
 
@@ -407,11 +408,15 @@ class ForbiddenVisionInpaintLite:
         final_mask[:, -1:] = 0
             
         return np.clip(final_mask, 0, 1)
-    
+    def _empty_latent(self, ref_tensor, device):
+        # ref_tensor is BHWC pixel tensor; latent is /8 in spatial dims, 4 channels
+        h, w = ref_tensor.shape[1], ref_tensor.shape[2]
+        return {"samples": torch.zeros((1, 4, max(1, h // 8), max(1, w // 8)), device=device)}
     def process_inpaint(self, model, vae, positive, negative, image, mask, steps, cfg, sampler, scheduler, 
                        denoise, seed, processing_resolution, manual_rotation, enable_pre_upscale, upscaler_model,
                        mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, blend_softness,
-                       enable_color_correction, enable_differential_diffusion, crop_padding, bypass_cropping):
+                       enable_color_correction, enable_differential_diffusion, crop_padding, bypass_cropping,
+                       bypass_latent_output=True):
         try:
             check_for_interruption()
             device = model_management.get_torch_device()
@@ -455,15 +460,11 @@ class ForbiddenVisionInpaintLite:
                     denoise_mask=sampling_mask_latent
                 )
                 
-                VAEDecodeClass = nodes.NODE_CLASS_MAPPINGS['VAEDecode']
-                vae_decoder = VAEDecodeClass()
-                result_tensor = vae_decoder.decode(vae, sampled_latent)[0]
-                
-                if result_tensor.min() < -0.5:
-                    result_tensor = (result_tensor + 1.0) / 2.0
-                result_tensor = torch.clamp(result_tensor, 0.0, 1.0)
-                
+                result_tensor = normalize_vae_decode_output(vae.decode(sampled_latent["samples"]))
+                if bypass_latent_output:
+                    return (result_tensor, self._empty_latent(result_tensor, device))
                 return (result_tensor, sampled_latent)
+
             
             cropped_face_tensor, sampler_mask_tensor, restore_info = self.mask_processor.process_and_crop(
                 image_tensor=image,
@@ -526,13 +527,7 @@ class ForbiddenVisionInpaintLite:
                 denoise_mask=sampling_mask_latent
             )
             
-            VAEDecodeClass = nodes.NODE_CLASS_MAPPINGS['VAEDecode']
-            vae_decoder = VAEDecodeClass()
-            generated_tensor = vae_decoder.decode(vae, sampled_latent)[0]
-            
-            if generated_tensor.min() < -0.5:
-                generated_tensor = (generated_tensor + 1.0) / 2.0
-            generated_tensor = torch.clamp(generated_tensor, 0.0, 1.0)
+            generated_tensor = normalize_vae_decode_output(vae.decode(sampled_latent["samples"]))
             
             generated_np = generated_tensor.cpu().numpy()[0]
             generated_np_uint8 = (np.clip(generated_np, 0, 1) * 255.0).round().astype(np.uint8)
@@ -579,7 +574,11 @@ class ForbiddenVisionInpaintLite:
             result_image[crop_y1:crop_y2, crop_x1:crop_x2] = blended_area
             
             result_tensor = torch.from_numpy(result_image.astype(np.float32) / 255.0).unsqueeze(0)
-            result_latent = vae_encoder.encode(vae, result_tensor)[0]
+            
+            if bypass_latent_output:
+                result_latent = self._empty_latent(result_tensor, device)
+            else:
+                result_latent = vae_encoder.encode(vae, result_tensor)[0]
             
             return (result_tensor, result_latent)
             

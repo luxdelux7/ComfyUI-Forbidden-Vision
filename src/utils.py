@@ -11,7 +11,82 @@ import numpy as np
 import cv2
 import folder_paths
 import comfy.model_management as model_management
+# === Latent shape helpers (SD 4D / Qwen-Image-Anima 5D dual mode) ===
 
+def latent_is_5d(latent_tensor):
+    """True if latent has a temporal dim (Qwen-Image VAE / Anima / Cosmos)."""
+    return latent_tensor.dim() == 5
+
+def latent_spatial_dims(latent_tensor):
+    """Return (H, W) regardless of 4D or 5D latent layout."""
+    if latent_tensor.dim() == 5:
+        # [B, C, T, H, W]
+        return latent_tensor.shape[3], latent_tensor.shape[4]
+    # [B, C, H, W]
+    return latent_tensor.shape[2], latent_tensor.shape[3]
+
+def latent_channel_count(latent_tensor):
+    """Channel count, works for both layouts."""
+    return latent_tensor.shape[1]
+def normalize_vae_decode_output(image_out):
+    """
+    WanVAE / Qwen-Image VAE returns 5D [B, T, H, W, C]. Downstream pixel-domain code
+    expects 4D [B, H, W, C]. Also handles value range normalization.
+    Confirmed Anima layout: [B, T=1, H, W, C] -> squeeze axis 1.
+    """
+    import torch
+    if image_out.dim() == 5:
+        if image_out.shape[1] == 1:
+            image_out = image_out.squeeze(1)
+        elif image_out.shape[2] == 1 and image_out.shape[-1] != 3:
+            # Fallback for channels-first 5D layout
+            image_out = image_out.squeeze(2)
+            if image_out.shape[1] == 3 and image_out.shape[-1] != 3:
+                image_out = image_out.permute(0, 2, 3, 1).contiguous()
+    if image_out.min() < -0.5:
+        image_out = (image_out + 1.0) / 2.0
+    return torch.clamp(image_out, 0.0, 1.0)
+def detect_model_latent_layout(model, vae=None):
+    """
+    Returns ('channels', 'is_temporal') for the given model.
+    Anima/Qwen-Image: (16, True). SDXL: (4, False). SD3/Flux: (16, False).
+    """
+    channels = 4
+    is_temporal = False
+    try:
+        lf = model.model.latent_format
+        channels = getattr(lf, "latent_channels", 4)
+        # Comfy marks temporal-latent formats with latent_dimensions=3 (T,H,W)
+        # or with a 'latent_rgb_factors_bias' that lives in 5D space.
+        latent_dims = getattr(lf, "latent_dimensions", 2)
+        is_temporal = latent_dims >= 3
+    except AttributeError:
+        pass
+    return channels, is_temporal
+
+def make_empty_latent(batch_size, height, width, model, device):
+    """Build an empty latent that matches the model's expected layout."""
+    import torch
+    channels, is_temporal = detect_model_latent_layout(model)
+    lh, lw = height // 8, width // 8
+    if is_temporal:
+        return torch.zeros([batch_size, channels, 1, lh, lw], device=device)
+    return torch.zeros([batch_size, channels, lh, lw], device=device)
+
+def to_4d_for_processing(latent_tensor):
+    """
+    Squeeze temporal dim for code paths that need 4D (mask resize, conditioning).
+    Returns (4d_tensor, was_5d_flag) so you can restore later.
+    """
+    if latent_tensor.dim() == 5 and latent_tensor.shape[2] == 1:
+        return latent_tensor.squeeze(2), True
+    return latent_tensor, False
+
+def restore_5d_if_needed(latent_tensor, was_5d):
+    """Inverse of to_4d_for_processing."""
+    if was_5d and latent_tensor.dim() == 4:
+        return latent_tensor.unsqueeze(2)
+    return latent_tensor
 
 RESOLUTIONS = {
         "📱 1:4 Ultra-Tall (512x2048)": (512, 2048),

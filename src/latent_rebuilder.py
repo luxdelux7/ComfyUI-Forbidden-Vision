@@ -70,7 +70,8 @@ class ForbiddenVisionRebuilder:
             final_latent = {"samples": samples}
             
             if vae is not None:
-                image_out = vae.decode(samples)
+                from .utils import normalize_vae_decode_output
+                image_out = normalize_vae_decode_output(vae.decode(samples))
                 return (final_latent, image_out,)
             else:
                 return (final_latent, blank_image,)

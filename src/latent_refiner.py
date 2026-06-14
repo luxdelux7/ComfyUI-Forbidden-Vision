@@ -273,14 +273,19 @@ class LatentRefiner:
                 if decode_cache_valid:
                     decoded_image = self.cached_decoded_image
                 else:
-                    decoded_image = vae.decode(input_key_tensor.to(device))
+                    from .utils import normalize_vae_decode_output
+                    decoded_image = normalize_vae_decode_output(vae.decode(input_key_tensor.to(device)))
                     self.cached_decoded_image = decoded_image
                     self.cached_vae_hash = current_vae_hash
                     self.cached_input_hash = current_input_hash
                     self.cached_input_hash_depth = None
 
             if decoded_image is None:
-                dummy_latent = latent if is_latent_input else {"samples": torch.zeros((1, 4, 64, 64))}
+                # Preserve the input latent's actual shape rather than forcing 4D
+                if is_latent_input:
+                    dummy_latent = latent
+                else:
+                    dummy_latent = {"samples": torch.zeros((1, 4, 64, 64))}
                 dummy_image = image if is_image_input else torch.zeros((1, 64, 64, 3))
                 return (dummy_latent, dummy_image)
 
@@ -394,9 +399,11 @@ class LatentRefiner:
             if vae is not None:
                 if use_tiled_vae:
                     encode_node = nodes.NODE_CLASS_MAPPINGS['VAEEncodeTiled']()
-                    final_latent = encode_node.encode(
+                    encoded = encode_node.encode(
                         vae, final_image_bhwc[:, :, :, :3], tile_size, overlap=64
                     )[0]
+                    # VAEEncodeTiled returns {"samples": tensor}, take the tensor
+                    final_latent = encoded["samples"] if isinstance(encoded, dict) else encoded
                 else:
                     final_latent = vae.encode(final_image_bhwc[:, :, :, :3])
             else:

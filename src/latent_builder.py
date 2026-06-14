@@ -68,8 +68,9 @@ class LatentBuilder:
         height = (height // 8) * 8
 
         device = model_management.get_torch_device()
-        
-        latent_tensor = torch.zeros([batch_size, 4, height // 8, width // 8], device=device)
+
+        from .utils import make_empty_latent
+        latent_tensor = make_empty_latent(batch_size, height, width, model, device)
         blank_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32, device=device)
         
         try:
@@ -91,7 +92,8 @@ class LatentBuilder:
                 final_latent = self._final_polish_pass(final_latent, model, positive, negative, sampler_info)
             
             if vae is not None:
-                image_out = vae.decode(final_latent["samples"])
+                from .utils import normalize_vae_decode_output
+                image_out = normalize_vae_decode_output(vae.decode(final_latent["samples"]))
                 return (final_latent, image_out,)
             else:
                 return (final_latent, blank_image,)

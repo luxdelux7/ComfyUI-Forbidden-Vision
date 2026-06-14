@@ -336,16 +336,19 @@ class ForbiddenVisionFaceProcessorIntegrated:
             mask_size = max(w, h, 1)
             blend_ratio = blend_softness / 400.0
             
+            MAX_KERNEL = 63
+            
             expand_amount = int(mask_size * blend_ratio * 0.8)
             if expand_amount > 0:
-                expand_kernel_size = expand_amount * 2 + 1
-                expand_kernel = torch.ones(expand_kernel_size, expand_kernel_size, device=mask_4d.device)
-                expanded_for_blur = kornia.morphology.dilation(core_mask, expand_kernel)
+                expand_kernel_size = min(expand_amount * 2 + 1, MAX_KERNEL)
+                expanded_for_blur = F.max_pool2d(
+                    core_mask, kernel_size=expand_kernel_size, stride=1, padding=expand_kernel_size // 2
+                )
             else:
                 expanded_for_blur = core_mask
 
             blur_amount = int(mask_size * blend_ratio * 1.2)
-            blur_kernel_size = max(3, blur_amount * 2 + 1)
+            blur_kernel_size = min(max(3, blur_amount * 2 + 1), MAX_KERNEL)
             sigma = blur_kernel_size / 3.0
             feathering_zone = kornia.filters.gaussian_blur2d(
                 expanded_for_blur, (blur_kernel_size, blur_kernel_size), (sigma, sigma)
@@ -564,12 +567,9 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
             input_image = None
             if latent is not None and "samples" in latent:
-         
+                from .utils import normalize_vae_decode_output
                 with torch.no_grad():
-                    input_image = vae.decode(latent["samples"])
-                    if input_image.min() < -0.5:
-                        input_image = (input_image + 1.0) / 2.0
-                    input_image = torch.clamp(input_image, 0.0, 1.0)
+                    input_image = normalize_vae_decode_output(vae.decode(latent["samples"]))
             else:
                 input_image = image
 
@@ -764,11 +764,9 @@ class ForbiddenVisionFaceProcessorIntegrated:
                     enable_differential_diffusion
                 )
                 
+                from .utils import normalize_vae_decode_output
                 with torch.no_grad():
-                    processed_face_batch = vae.decode(processed_latent["samples"])
-                    if processed_face_batch.min() < -0.5: 
-                        processed_face_batch = (processed_face_batch + 1.0) / 2.0
-                    processed_face_batch = torch.clamp(processed_face_batch, 0.0, 1.0)
+                    processed_face_batch = normalize_vae_decode_output(vae.decode(processed_latent["samples"]))
                 
                 lightness_triggered = False
                 if enable_lightness_rescue:
@@ -788,11 +786,9 @@ class ForbiddenVisionFaceProcessorIntegrated:
                         sampling_mask_blur_strength=sampling_mask_blur_strength
                     )
                     
+                    from .utils import normalize_vae_decode_output
                     with torch.no_grad():
-                        refined_face = vae.decode(refinement_latent["samples"])
-                        if refined_face.min() < -0.5:
-                            refined_face = (refined_face + 1.0) / 2.0
-                        processed_face_batch = torch.clamp(refined_face, 0.0, 1.0)
+                        processed_face_batch = normalize_vae_decode_output(vae.decode(refinement_latent["samples"]))
 
                 manual_rot = restore_info.get('manual_rotation', "None")
                 if manual_rot != "None":
@@ -985,15 +981,24 @@ class ForbiddenVisionFaceProcessorIntegrated:
                                     steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
                                     sampling_mask_blur_size, sampling_mask_blur_strength):
         try:
+            from .utils import latent_spatial_dims, latent_is_5d
+
             face_latent = self.encode_image_to_latent(cropped_face, vae)
             latent_samples = face_latent["samples"]
-            
-            B, C, H, W = latent_samples.shape
-            resized_mask = self.process_inpaint_mask(face_mask, H, W, latent_samples.device, 
-                                        sampling_mask_blur_size, sampling_mask_blur_strength)
+
+            H, W = latent_spatial_dims(latent_samples)
+            resized_mask = self.process_inpaint_mask(
+                face_mask, H, W, latent_samples.device,
+                sampling_mask_blur_size, sampling_mask_blur_strength
+            )
+
+            if latent_is_5d(latent_samples):
+                mask_for_cond = resized_mask.unsqueeze(1).unsqueeze(2)
+            else:
+                mask_for_cond = resized_mask.unsqueeze(1)
 
             conditioned_positive, conditioned_negative = self.prepare_inpaint_conditioning(
-                positive, negative, latent_samples, resized_mask.unsqueeze(1)
+                positive, negative, latent_samples, mask_for_cond
             )
             
             sampled_latent = self.run_ksampler(
@@ -1070,7 +1075,13 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error in inpaint sampling: {e}")
-            return {"samples": torch.zeros((1, 4, 64, 64), dtype=torch.float32)}
+            from .utils import detect_model_latent_layout
+            channels, is_temporal = detect_model_latent_layout(model)
+            if is_temporal:
+                fallback = torch.zeros((1, channels, 1, 64, 64), dtype=torch.float32)
+            else:
+                fallback = torch.zeros((1, channels, 64, 64), dtype=torch.float32)
+            return {"samples": fallback}
   
     def process_inpaint_mask(self, face_mask, latent_height, latent_width, device, blur_size, blur_strength):
         try:
@@ -1147,6 +1158,9 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
             if denoise_mask is not None:
                 denoise_mask = denoise_mask.to(device)
+                from .utils import latent_is_5d
+                if latent_is_5d(latent_image) and denoise_mask.dim() == 3:
+                    denoise_mask = denoise_mask.unsqueeze(1)
 
             try:
                 noise = comfy.sample.prepare_noise(latent_image, seed, device=device)
@@ -1190,7 +1204,11 @@ class ForbiddenVisionFaceProcessorIntegrated:
             raise
         except Exception as e:
             print(f"Error in KSampler: {e}")
-            latent_shape = latent.get("samples", torch.zeros((1, 4, 64, 64))).shape
+            input_samples = latent.get("samples")
+            if input_samples is not None:
+                latent_shape = input_samples.shape
+            else:
+                latent_shape = (1, 4, 64, 64)
             return {"samples": torch.zeros(latent_shape, device=model_management.get_torch_device())}
 
     def prepare_conditioning_for_sampling(self, conditioning, device):

@@ -64,14 +64,14 @@ class LatentBuilder:
         else: 
             width, height = self.RESOLUTIONS[resolution_preset]
 
-        width = (width // 8) * 8
-        height = (height // 8) * 8
+        width = max(64, (width // 16) * 16)
+        height = max(64, (height // 16) * 16)
 
         device = model_management.get_torch_device()
 
         from .utils import make_empty_latent
         latent_tensor = make_empty_latent(batch_size, height, width, model, device)
-        blank_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32, device=device)
+        blank_image = torch.zeros((batch_size, 1, 1, 3), dtype=torch.float32)
         
         try:
             result_tensor = self._standard_sampling(
@@ -101,7 +101,9 @@ class LatentBuilder:
         except model_management.InterruptProcessingException:
             raise
         except Exception as e:
+            import traceback
             print(f"❌ Error during sampling: {e}")
+            traceback.print_exc()
             return ({"samples": latent_tensor}, blank_image,)
     
     def _get_cfg_at_step(self, step, total_steps, cfg_start, cfg_finish, cfg_mode, cfg_pivot=4.0):
@@ -147,18 +149,17 @@ class LatentBuilder:
         if cfg_finish is None:
             cfg_finish = cfg
 
+        work_model = model.clone()
+
         positive = self.prepare_conditioning(positive_cond, device)
         negative = self.prepare_conditioning(negative_cond, device)
         noise = comfy.sample.prepare_noise(latent_tensor, seed)
 
-        previewer = latent_preview.get_previewer(device, model.model.latent_format)
+        previewer = latent_preview.get_previewer(device, work_model.model.latent_format)
         pbar = comfy.utils.ProgressBar(steps)
 
-        # Always work on a copied dict so we don't mutate shared model state
-        original_options = dict(model.model_options) if model.model_options else {}
-        patched_options = dict(original_options)
+        model_options = dict(work_model.model_options) if work_model.model_options else {}
 
-        # Track the REAL sampler step from the callback
         step_state = {"current_step": 0}
 
         def callback(step, x0, x, total_steps):
@@ -170,64 +171,48 @@ class LatentBuilder:
                 pbar.update_absolute(step + 1, total_steps, None)
 
         if cfg_mode != "Constant":
-            # Critical fix:
             # If the base cfg passed into sampler.sample() is exactly 1.0,
             # Comfy can skip unconditional guidance unless this is forced on.
-            patched_options["disable_cfg1_optimization"] = True
+            model_options["disable_cfg1_optimization"] = True
 
             def dynamic_cfg(args):
                 cond = args["cond"]
                 uncond = args["uncond"]
 
-                # Use the actual sampler step from callback, not function-call count
                 current_step = min(step_state["current_step"], steps - 1)
                 step_cfg = self._get_cfg_at_step(
-                    current_step,
-                    steps,
-                    cfg,
-                    cfg_finish,
-                    cfg_mode,
-                    cfg_pivot
+                    current_step, steps, cfg, cfg_finish, cfg_mode, cfg_pivot
                 )
-
-                # Safety clamp to avoid weird negative / zero behavior
                 step_cfg = max(0.0, float(step_cfg))
 
-                # Comfy expects sampler_cfg_function to return the "guidance-space" tensor,
-                # not the final denoised prediction.
                 return uncond + step_cfg * (cond - uncond)
 
-            patched_options["sampler_cfg_function"] = dynamic_cfg
+            model_options["sampler_cfg_function"] = dynamic_cfg
 
-        # Temporarily patch model options
-        model.model_options = patched_options
+        work_model.model_options = model_options
 
-        try:
-            sampler = comfy.samplers.KSampler(
-                model,
-                steps=steps,
-                device=device,
-                sampler=sampler_name,
-                scheduler=scheduler,
-                denoise=1.0,
-                model_options=model.model_options
-            )
+        sampler = comfy.samplers.KSampler(
+            work_model,
+            steps=steps,
+            device=device,
+            sampler=sampler_name,
+            scheduler=scheduler,
+            denoise=1.0,
+            model_options=model_options
+        )
 
-            samples = sampler.sample(
-                noise,
-                positive,
-                negative,
-                cfg=cfg,  # keep this as the starting/base cfg
-                latent_image=latent_tensor,
-                start_step=0,
-                last_step=steps,
-                force_full_denoise=True,
-                callback=callback,
-                disable_pbar=False
-            )
-        finally:
-            # Always restore original options
-            model.model_options = original_options
+        samples = sampler.sample(
+            noise,
+            positive,
+            negative,
+            cfg=cfg,
+            latent_image=latent_tensor,
+            start_step=0,
+            last_step=steps,
+            force_full_denoise=True,
+            callback=callback,
+            disable_pbar=False
+        )
 
         return samples
 

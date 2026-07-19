@@ -54,7 +54,15 @@ class ForbiddenVisionRebuilder:
         
         device = model_management.get_torch_device()
         input_latent = latent["samples"]
-        blank_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32, device=device)
+
+        # Reconcile latent layout with what the model expects
+        from .utils import detect_model_latent_layout
+        _, model_is_temporal = detect_model_latent_layout(model)
+        if model_is_temporal and input_latent.dim() == 4:
+            input_latent = input_latent.unsqueeze(2)
+        elif not model_is_temporal and input_latent.dim() == 5 and input_latent.shape[2] == 1:
+            input_latent = input_latent.squeeze(2)
+        blank_image = torch.zeros((input_latent.shape[0], 1, 1, 3), dtype=torch.float32)
         
         try:
             positive_prep = self.prepare_conditioning(positive, device)

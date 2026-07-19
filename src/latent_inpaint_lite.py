@@ -272,6 +272,9 @@ class ForbiddenVisionInpaintLite:
 
             if denoise_mask is not None:
                 denoise_mask = denoise_mask.to(device)
+                from .utils import latent_is_5d
+                if latent_is_5d(latent_image) and denoise_mask.dim() == 4:
+                    denoise_mask = denoise_mask.unsqueeze(2)   # [B,1,H,W] -> [B,1,1,H,W]
 
             try:
                 noise = comfy.sample.prepare_noise(latent_image, seed, device=device)
@@ -281,7 +284,7 @@ class ForbiddenVisionInpaintLite:
             
             if denoise_mask is not None:
                 cond_mask = denoise_mask
-                if len(cond_mask.shape) == 3:
+                if cond_mask.dim() == 3:
                     cond_mask = cond_mask.unsqueeze(1)
                 
                 positive_cond, negative_cond = self.prepare_inpaint_conditioning(
@@ -408,10 +411,13 @@ class ForbiddenVisionInpaintLite:
         final_mask[:, -1:] = 0
             
         return np.clip(final_mask, 0, 1)
-    def _empty_latent(self, ref_tensor, device):
-        # ref_tensor is BHWC pixel tensor; latent is /8 in spatial dims, 4 channels
+    def _empty_latent(self, ref_tensor, device, model=None):
+        """Placeholder latent matching the model's expected layout."""
         h, w = ref_tensor.shape[1], ref_tensor.shape[2]
-        return {"samples": torch.zeros((1, 4, max(1, h // 8), max(1, w // 8)), device=device)}
+        if model is not None:
+            from .utils import make_empty_latent
+            return {"samples": make_empty_latent(ref_tensor.shape[0], h, w, model)}
+        return {"samples": torch.zeros((ref_tensor.shape[0], 4, max(1, h // 8), max(1, w // 8)), device=device)}
     def process_inpaint(self, model, vae, positive, negative, image, mask, steps, cfg, sampler, scheduler, 
                        denoise, seed, processing_resolution, manual_rotation, enable_pre_upscale, upscaler_model,
                        mask_expansion, sampling_mask_blur_size, sampling_mask_blur_strength, blend_softness,
@@ -434,7 +440,8 @@ class ForbiddenVisionInpaintLite:
                 vae_encoder = VAEEncodeClass()
                 latent = vae_encoder.encode(vae, image_tensor)[0]
                 
-                latent_h, latent_w = latent["samples"].shape[2], latent["samples"].shape[3]
+                from .utils import latent_spatial_dims
+                latent_h, latent_w = latent_spatial_dims(latent["samples"])
                 sampling_mask_latent = F.interpolate(mask_tensor, size=(latent_h, latent_w), mode='bilinear', align_corners=False)
                 
                 if sampling_mask_blur_size > 1 and sampling_mask_blur_strength > 0:
@@ -462,7 +469,7 @@ class ForbiddenVisionInpaintLite:
                 
                 result_tensor = normalize_vae_decode_output(vae.decode(sampled_latent["samples"]))
                 if bypass_latent_output:
-                    return (result_tensor, self._empty_latent(result_tensor, device))
+                    return (result_tensor, self._empty_latent(result_tensor, device, model))
                 return (result_tensor, sampled_latent)
 
             
@@ -479,7 +486,7 @@ class ForbiddenVisionInpaintLite:
             )
             
             if restore_info.get("original_image_size") == (0, 0):
-                return (image, torch.zeros((1, 4, 64, 64), device=device))
+                return (image, self._empty_latent(image, device, model))
 
             if manual_rotation != "None":
                 image_np = (cropped_face_tensor.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
@@ -500,7 +507,8 @@ class ForbiddenVisionInpaintLite:
             vae_encoder = VAEEncodeClass()
             latent = vae_encoder.encode(vae, cropped_face_tensor)[0]
             
-            latent_h_real, latent_w_real = latent["samples"].shape[2], latent["samples"].shape[3]
+            from .utils import latent_spatial_dims
+            latent_h_real, latent_w_real = latent_spatial_dims(latent["samples"])
             
             sampling_mask_latent = F.interpolate(sampler_mask_tensor, size=(latent_h_real, latent_w_real), mode='bilinear', align_corners=False)
             
@@ -576,7 +584,7 @@ class ForbiddenVisionInpaintLite:
             result_tensor = torch.from_numpy(result_image.astype(np.float32) / 255.0).unsqueeze(0)
             
             if bypass_latent_output:
-                result_latent = self._empty_latent(result_tensor, device)
+                result_latent = self._empty_latent(result_tensor, device, model)
             else:
                 result_latent = vae_encoder.encode(vae, result_tensor)[0]
             
@@ -588,4 +596,4 @@ class ForbiddenVisionInpaintLite:
             print(f"Error in inpaint processing: {e}")
             import traceback
             traceback.print_exc()
-            return (image, vae.encode(image))
+            return (image, self._empty_latent(image, model_management.get_torch_device(), model))

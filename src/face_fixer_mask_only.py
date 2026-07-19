@@ -100,8 +100,12 @@ class ForbiddenVisionFaceFixerMaskOnly:
         except Exception as e:
             print(f"[Face Mask Generator] Error during mask generation: {e}")
             try:
-                h, w = image.shape[1], image.shape[2] if image is not None else (512, 512)
-                device = image.device if image is not None else model_management.get_torch_device()
+                if image is not None:
+                    h, w = image.shape[1], image.shape[2]
+                    device = image.device
+                else:
+                    h, w = 512, 512
+                    device = model_management.get_torch_device()
                 fallback_mask = torch.zeros((1, h, w), dtype=torch.float32, device=device)
                 return (fallback_mask,)
             except:

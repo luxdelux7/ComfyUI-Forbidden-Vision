@@ -429,10 +429,11 @@ class ForbiddenVisionFaceProcessorIntegrated:
                 temp_face_canvas = torch.zeros_like(final_canvas_tensor)
                 temp_face_canvas[:, crop_y1:crop_y2, crop_x1:crop_x2, :] = resized_processed_face
 
-                full_blend_mask = torch.from_numpy(restore_info.get("blend_mask")).to(device)
-                if full_blend_mask is None:
+                full_blend_mask_np = restore_info.get("blend_mask")
+                if full_blend_mask_np is None:
                     paste_mask_crop = torch.ones((actual_crop_h, actual_crop_w), device=device)
                 else:
+                    full_blend_mask = torch.from_numpy(full_blend_mask_np).to(device)
                     paste_mask_crop = full_blend_mask[crop_y1:crop_y2, crop_x1:crop_x2]
 
                 compositing_mask_crop = self.create_compositing_blend_mask_gpu(paste_mask_crop.unsqueeze(0), blend_softness)
@@ -463,10 +464,9 @@ class ForbiddenVisionFaceProcessorIntegrated:
             check_for_interruption()
             device = original_crop.device
             
-            if original_crop.ndim == 4: original_crop = original_crop.squeeze(0)
-            if processed_crop.ndim == 4: processed_crop = processed_crop.squeeze(0)
-            if mask.ndim == 4: mask = mask.squeeze(0).squeeze(0)
-            if mask.ndim == 3: mask = mask.squeeze(0)
+            if original_crop.ndim == 4: original_crop = original_crop[0]
+            if processed_crop.ndim == 4: processed_crop = processed_crop[0]
+            while mask.ndim > 2: mask = mask[0]
             
             h, w = processed_crop.shape[0], processed_crop.shape[1]
 
@@ -551,8 +551,126 @@ class ForbiddenVisionFaceProcessorIntegrated:
             print(f"[Face Processor] Error in lightness rescue logic: {e}. Keeping original.")
             if processed_crop.ndim == 3: return processed_crop.unsqueeze(0), False
             return processed_crop, False
+    def process_face_complete(self, model, vae, positive, negative,
+                        steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
+                        face_selection, detection_confidence, manual_rotation, processing_resolution,
+                        enable_pre_upscale, upscaler_model, crop_padding,
+                        face_positive_prompt, replace_positive_prompt, face_negative_prompt,
+                        replace_negative_prompt, exclusions,
+                        blend_softness, mask_expansion,
+                        sampling_mask_blur_size, sampling_mask_blur_strength,
+                        enable_color_correction, enable_segmentation, enable_differential_diffusion,
+                        enable_lightness_rescue, enable_final_refinement,
+                        offload_models_to_cpu=True,
+                        image=None, clip=None, latent=None):
+        """Batch dispatcher: decodes input, then runs the face pipeline per image."""
+        input_image = None
+        try:
+            if latent is not None and "samples" in latent:
+                from .utils import normalize_vae_decode_output
+                with torch.no_grad():
+                    input_image = normalize_vae_decode_output(vae.decode(latent["samples"]))
+            else:
+                input_image = image
 
-    def process_face_complete(self, model, vae, positive, negative, 
+            if input_image is None or model is None or vae is None:
+                print("ERROR: Required inputs (image/latent, model, vae) are missing.")
+                return self.create_safe_fallback_outputs(input_image, processing_resolution)
+
+            if input_image.dim() == 3:
+                input_image = input_image.unsqueeze(0)
+
+            common = dict(
+                model=model, vae=vae, positive=positive, negative=negative,
+                steps=steps, cfg_scale=cfg_scale, sampler=sampler, scheduler=scheduler,
+                denoise_strength=denoise_strength,
+                face_selection=face_selection, detection_confidence=detection_confidence,
+                manual_rotation=manual_rotation, processing_resolution=processing_resolution,
+                enable_pre_upscale=enable_pre_upscale, upscaler_model=upscaler_model,
+                crop_padding=crop_padding,
+                face_positive_prompt=face_positive_prompt,
+                replace_positive_prompt=replace_positive_prompt,
+                face_negative_prompt=face_negative_prompt,
+                replace_negative_prompt=replace_negative_prompt,
+                exclusions=exclusions,
+                blend_softness=blend_softness, mask_expansion=mask_expansion,
+                sampling_mask_blur_size=sampling_mask_blur_size,
+                sampling_mask_blur_strength=sampling_mask_blur_strength,
+                enable_color_correction=enable_color_correction,
+                enable_segmentation=enable_segmentation,
+                enable_differential_diffusion=enable_differential_diffusion,
+                enable_lightness_rescue=enable_lightness_rescue,
+                enable_final_refinement=enable_final_refinement,
+                clip=clip,
+            )
+
+            batch_size = input_image.shape[0]
+
+            if batch_size == 1:
+                return self._process_one_image(input_image, seed=seed, **common)
+
+            finals, faces, comparisons, masks = [], [], [], []
+            for b in range(batch_size):
+                check_for_interruption()
+                print(f"[Face Processor] Batch image {b + 1}/{batch_size}")
+                result = self._process_one_image(
+                    input_image[b:b + 1], seed=seed + b * 1000, **common
+                )
+                finals.append(result[0])
+                faces.append(result[1])
+                comparisons.append(result[2])
+                masks.append(result[3])
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            return (
+                torch.cat([f.to(finals[0].device) for f in finals], dim=0),
+                self._stack_previews(faces, processing_resolution),
+                self._stack_previews(comparisons, processing_resolution),
+                torch.cat([m.to(masks[0].device) for m in masks], dim=0),
+            )
+
+        except model_management.InterruptProcessingException:
+            raise
+        except Exception as e:
+            import traceback
+            print(f"An error occurred during batch face processing: {e}")
+            traceback.print_exc()
+            return self.create_safe_fallback_outputs(input_image, processing_resolution)
+        finally:
+            if offload_models_to_cpu:
+                try:
+                    self.face_detector.model_manager.offload_to_cpu()
+                except Exception as e:
+                    print(f"ForbiddenVision: Offload failed (non-fatal): {e}")
+
+    def _stack_previews(self, tensors, fallback_size):
+        """Concatenate per-image preview tensors, resizing to a common size first."""
+        valid = []
+        for t in tensors:
+            if t is None or t.numel() == 0:
+                continue
+            valid.append(t if t.dim() == 4 else t.unsqueeze(0))
+
+        if not valid:
+            return torch.zeros((1, fallback_size, fallback_size, 3), dtype=torch.float32)
+
+        device = valid[0].device
+        target_h, target_w = valid[0].shape[1], valid[0].shape[2]
+
+        resized = []
+        for t in valid:
+            t = t.to(device)
+            if t.shape[1] != target_h or t.shape[2] != target_w:
+                t = F.interpolate(
+                    t.permute(0, 3, 1, 2), size=(target_h, target_w),
+                    mode='bicubic', align_corners=False, antialias=True
+                ).permute(0, 2, 3, 1)
+            resized.append(t)
+
+        return torch.cat(resized, dim=0)
+    def _process_one_image(self, input_image, model, vae, positive, negative,
                         steps, cfg_scale, sampler, scheduler, denoise_strength, seed,
                         face_selection, detection_confidence, manual_rotation, processing_resolution, enable_pre_upscale, upscaler_model, crop_padding,
                         face_positive_prompt, replace_positive_prompt, face_negative_prompt, replace_negative_prompt, exclusions,
@@ -565,18 +683,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
         try:
             check_for_interruption()
 
-            input_image = None
-            if latent is not None and "samples" in latent:
-                from .utils import normalize_vae_decode_output
-                with torch.no_grad():
-                    input_image = normalize_vae_decode_output(vae.decode(latent["samples"]))
-            else:
-                input_image = image
-
-            if input_image is None or model is None or vae is None:
-                print("ERROR: Required inputs (image/latent, model, vae) are missing.")
-                return self.create_safe_fallback_outputs(input_image, processing_resolution)
-
+            
             original_image = input_image
             processing_image = input_image.clone()
             final_positive_for_face, final_negative_for_face = positive, negative
@@ -823,12 +930,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
         except Exception as e:
             print(f"An error occurred during the main face processing workflow: {e}")
             return self.create_safe_fallback_outputs(input_image, processing_resolution)
-        finally:
-            if offload_models_to_cpu:
-                try:
-                    self.face_detector.model_manager.offload_to_cpu()
-                except Exception as e:
-                    print(f"ForbiddenVision: Offload failed (non-fatal): {e}")
+
     
     def apply_manual_rotation(self, image_np, rotation_option):
         if rotation_option == "None":

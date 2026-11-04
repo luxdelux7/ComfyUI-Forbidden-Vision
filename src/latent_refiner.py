@@ -40,6 +40,7 @@ class LatentRefiner:
                 "use_tiled_vae": ("BOOLEAN", {"default": False, "label_on": "Enabled", "label_off": "Disabled"}),
                 "tile_size": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64}),
                 "offload_models_to_cpu": ("BOOLEAN", {"default": True, "tooltip": "Move neural corrector and depth models from VRAM to RAM after processing. Frees GPU memory for other nodes (e.g. checkpoint swaps in queued workflows). Disable if you're chaining many refiner passes and want to skip the small reload overhead."}),
+                "skip_encode": ("BOOLEAN", {"default": False, "label_on": "Image Only", "label_off": "Encode Latent", "tooltip": "When enabled, skips VAE re-encoding and passes the processed image straight through. Use with decode-only VAEs or when you only need the image output. The latent output will be the original input latent (or zeros if image-only input)."}),
             },
             "optional": {
                 "latent": ("LATENT",),
@@ -104,25 +105,31 @@ class LatentRefiner:
             if run_depth:
                 self.cached_depth_map = None
 
-            img_np_uint8 = None
-
             if run_depth:
-                if img_np_uint8 is None:
-                    img_np_uint8 = (image_tensor[0].cpu().numpy() * 255).astype(np.uint8)
+                # One depth map per image in the batch (previously image 0's
+                # depth was reused for every image).
+                depth_maps = []
+                any_ok = False
+                for i in range(image_tensor.shape[0]):
+                    check_for_interruption()
+                    img_np_uint8 = (image_tensor[i].cpu().numpy() * 255).astype(np.uint8)
+                    depth_tensor = self.depth_manager.infer_depth_full(img_np_uint8, depth_model_name)
 
-                depth_tensor = self.depth_manager.infer_depth_full(img_np_uint8, depth_model_name)
+                    if depth_tensor is not None:
+                        while depth_tensor.ndim < 4:
+                            depth_tensor = depth_tensor.unsqueeze(0)
+                        if depth_tensor.shape[-2:] != (h, w):
+                            depth_tensor = F.interpolate(
+                                depth_tensor, size=(h, w), mode="bilinear", align_corners=False
+                            )
+                        depth_maps.append(depth_tensor[:1].to(device=device, dtype=dtype))
+                        any_ok = True
+                    else:
+                        # Flat depth = no relight/DoF effect on this image.
+                        depth_maps.append(torch.zeros((1, 1, h, w), device=device, dtype=dtype))
 
-                if depth_tensor is not None:
-                    if depth_tensor.shape[-2:] != (h, w):
-                        depth_tensor = F.interpolate(
-                            depth_tensor, size=(h, w), mode="bilinear", align_corners=False
-                        )
-
-                    self.cached_depth_map = depth_tensor.to(
-                        device=device,
-                        dtype=dtype,
-                        non_blocking=True
-                    )
+                if any_ok:
+                    self.cached_depth_map = torch.cat(depth_maps, dim=0)
 
 
         except model_management.InterruptProcessingException:
@@ -216,6 +223,7 @@ class LatentRefiner:
                         maintain_aspect_ratio, enforce_mod32_boundaries,
                         use_tiled_vae, tile_size,
                         offload_models_to_cpu=True,
+                        skip_encode=False,
                         latent=None, vae=None, image=None, **kwargs):
         try:
             check_for_interruption()
@@ -237,6 +245,7 @@ class LatentRefiner:
             enforce_mod32_boundaries = bool(enforce_mod32_boundaries)
             use_tiled_vae = bool(use_tiled_vae)
             offload_models_to_cpu = bool(offload_models_to_cpu)
+            skip_encode = bool(skip_encode)
             # --- End sanitization ---
             device = model_management.get_torch_device()
 
@@ -396,21 +405,42 @@ class LatentRefiner:
             final_image_bhwc = torch.clamp(final_image_bhwc, 0.0, 1.0)
 
             final_latent = None
-            if vae is not None:
-                if use_tiled_vae:
-                    encode_node = nodes.NODE_CLASS_MAPPINGS['VAEEncodeTiled']()
-                    encoded = encode_node.encode(
-                        vae, final_image_bhwc[:, :, :, :3], tile_size, overlap=64
-                    )[0]
-                    # VAEEncodeTiled returns {"samples": tensor}, take the tensor
-                    final_latent = encoded["samples"] if isinstance(encoded, dict) else encoded
-                else:
-                    final_latent = vae.encode(final_image_bhwc[:, :, :, :3])
-            else:
+            if skip_encode or vae is None:
                 final_latent = (
                     latent["samples"] if is_latent_input
                     else torch.zeros((1, 4, 64, 64))
                 )
+                if skip_encode and vae is not None:
+                    print("[LatentRefiner] skip_encode=True: bypassing VAE encode, passing image through.")
+            else:
+                batch_size = final_image_bhwc.shape[0]
+                pixels = final_image_bhwc[:, :, :, :3]
+
+                def _encode(px):
+                    if use_tiled_vae:
+                        encode_node = nodes.NODE_CLASS_MAPPINGS['VAEEncodeTiled']()
+                        encoded = encode_node.encode(vae, px, tile_size, overlap=64)[0]
+                        # VAEEncodeTiled returns {"samples": tensor}, take the tensor
+                        s = encoded["samples"] if isinstance(encoded, dict) else encoded
+                    else:
+                        s = vae.encode(px)
+                    return s.float()
+
+                def _encode_per_image():
+                    return torch.cat([_encode(pixels[i:i + 1]) for i in range(batch_size)], dim=0)
+
+                if batch_size > 1 and getattr(vae, "_fv_folds_batch", False):
+                    final_latent = _encode_per_image()
+                else:
+                    final_latent = _encode(pixels)
+                    if batch_size > 1 and final_latent.shape[0] != batch_size:
+                        # Video VAE (e.g. Wan) treated the image batch as video frames
+                        # and returned fewer latents than images. Encode each image
+                        # on its own instead, and remember this for this VAE.
+                        vae._fv_folds_batch = True
+                        print(f"[LatentRefiner] VAE folded {batch_size} images into "
+                              f"{final_latent.shape[0]} latent(s); encoding per image.")
+                        final_latent = _encode_per_image()
 
             return ({"samples": final_latent}, final_image_bhwc.cpu())
 
@@ -584,31 +614,36 @@ class LatentRefiner:
             check_for_interruption()
             if depth_map is None: return image_bchw
 
-            h, w = image_bchw.shape[-2:]
+            orig_dtype = image_bchw.dtype
+            # torch.quantile needs float32/float64, so do the math in float32.
+            image_f = image_bchw.float()
+            depth_map = depth_map.float()
+
+            h, w = image_f.shape[-2:]
             if depth_map.shape[-2:] != (h, w):
                 depth_map = F.interpolate(depth_map, size=(h, w), mode='bilinear', align_corners=False)
 
             calibrated_strength = dof_strength ** 1.5
-            
-            foreground_mask = depth_map > torch.quantile(depth_map, 0.90)
-            foreground_depths = depth_map[foreground_mask]
-            
-            if foreground_depths.numel() > 0:
-                focus_plane = torch.mean(foreground_depths)
-            else:
-                focus_plane = torch.quantile(depth_map, 0.96)
-            
-            dist = torch.abs(depth_map - focus_plane)
             tolerance = 0.05
-            blur_map = torch.clamp((dist - tolerance) / (1.0 - tolerance), 0.0, 1.0)
-            blur_map = blur_map * calibrated_strength
-            
+
+            # Focus plane per image, so each image in a batch focuses on its own subject.
+            blur_maps = []
+            for i in range(image_f.shape[0]):
+                d = depth_map[min(i, depth_map.shape[0] - 1)]
+                foreground_depths = d[d > torch.quantile(d, 0.90)]
+                if foreground_depths.numel() > 0:
+                    focus_plane = torch.mean(foreground_depths)
+                else:
+                    focus_plane = torch.quantile(d, 0.96)
+                dist = torch.abs(d - focus_plane)
+                blur_maps.append(torch.clamp((dist - tolerance) / (1.0 - tolerance), 0.0, 1.0))
+            blur_map = torch.stack(blur_maps, dim=0) * calibrated_strength
+
             max_kernel = 21
-            blurred = kornia.filters.gaussian_blur2d(image_bchw, (max_kernel, max_kernel), (10.0, 10.0))
-            
-            return torch.lerp(image_bchw, blurred, blur_map)
+            blurred = kornia.filters.gaussian_blur2d(image_f, (max_kernel, max_kernel), (10.0, 10.0))
+
+            return torch.lerp(image_f, blurred, blur_map).to(orig_dtype)
 
         except Exception as e:
             print(f"DoF error: {e}")
             return image_bchw
-        

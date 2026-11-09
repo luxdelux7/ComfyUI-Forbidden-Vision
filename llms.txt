@@ -1,0 +1,15 @@
+# ComfyUI-Forbidden-Vision
+
+> A ComfyUI extension that provides custom-trained models for face detection, segmentation, and automatic face fixing, plus neural color correction and first-pass sampling nodes for realistic, anime, and NSFW content.
+
+Python-based custom node pack for ComfyUI, installed via ComfyUI Manager (search "Forbidden Vision") or manually. Models download automatically from HuggingFace on first run. Includes Fixer, Refiner, Builder, Inpainter, Rebuilder, Fixer Mask, and Settings nodes, with an example workflow in comfyui_workflows/Forbidden_Vision_Full_All_In_One.json.
+
+## Docs
+
+- [ComfyUI-Forbidden-Vision README](https://raw.githubusercontent.com/luxdelux7/ComfyUI-Forbidden-Vision/main/README.md): Modern alternative to ADetailer and FaceDetailer with custom trained models, workflow overview, and quick start.
+- [What Makes It Different](https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/blob/main/README.md#-what-makes-it-different): Three models trained from scratch for detection, segmentation, and neural correction of tone, exposure, and color.
+- [Quick Start](https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/blob/main/README.md#-quick-start): Install via ComfyUI Manager or manually, load the example workflow, and enable Builder, Refiner, Second Pass, and Face Fix.
+- [What's Included](https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/blob/main/README.md#-whats-included): Core Fixer, Refiner, and Builder nodes plus Inpainter, Rebuilder, Fixer Mask, and Settings tools.
+- [Fixer Node](https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/blob/main/README.md#-fixer-node): Face detection and masking with YOLO11, NSFW support, detail-aware segmentation, and context-aware inpainting features.
+- [Installation](https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/blob/main/README.md#️-installation): ComfyUI Manager and manual install steps, recommended Phhofm upscale models, and Fixer sampling and face selection settings.
+- [How to Cite Forbidden Vision](https://github.com/luxdelux7/ComfyUI-Forbidden-Vision/blob/main/README.md#-how-to-cite-forbidden-vision): BibTeX citation entry for ComfyUI Forbidden Vision, with author, title, year, and GitHub repository URL.
